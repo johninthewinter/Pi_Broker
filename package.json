@@ -1,0 +1,38 @@
+{
+  "name": "pi-broker",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "pi-broker": "bin/pi-broker.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/open-pi-windows.mjs",
+    "scripts/open-pi-windows.sh",
+    "extensions/pi-broker-bridge.ts",
+    "README.md",
+    "SECURITY.md",
+    "PROOF-INDEX.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "quickstart": "bash scripts/quickstart.sh",
+    "quickstart:stop": "bash scripts/quickstart-stop.sh",
+    "poc": "python3 scripts/interactive-poc.py",
+    "poc:hosts": "python3 scripts/host-compat-poc.py"
+  },
+  "dependencies": {
+    "@gotgenes/pi-permission-system": "^25.0.0",
+    "@langfuse/otel": "^5.10.0",
+    "@langfuse/tracing": "^5.10.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@opentelemetry/sdk-node": "^0.221.0",
+    "zod": "^4.4.3"
+  }
+}

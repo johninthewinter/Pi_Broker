@@ -1,0 +1,8 @@
+/.poc/
+/artifacts/
+/node_modules/
+/__pycache__/
+/*.pyc
+/*.sock
+/.DS_Store
+.DS_Store

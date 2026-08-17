@@ -1,0 +1,47 @@
+{
+  "debugLog": false,
+  "permissionReviewLog": false,
+  "yoloMode": false,
+  "permission": {
+    "*": "deny",
+    "path": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.pem": "deny",
+      "*.key": "deny"
+    },
+    "external_directory": "deny",
+    "read": "allow",
+    "write": "allow",
+    "edit": "allow",
+    "grep": "allow",
+    "find": "allow",
+    "ls": "allow",
+    "bash": {
+      "*": "ask",
+      "pwd": "allow",
+      "ls": "allow",
+      "ls *": "allow",
+      "rg *": "allow",
+      "grep *": "allow",
+      "find *": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "npm test*": "allow",
+      "npm run test*": "allow",
+      "rm *": "deny",
+      "rmdir *": "deny",
+      "mv *": "deny",
+      "sudo *": "deny",
+      "git reset*": "deny",
+      "git clean*": "deny",
+      "git checkout*": "deny",
+      "git restore*": "deny",
+      "git commit*": "deny",
+      "git push*": "deny",
+      "git merge*": "deny",
+      "git rebase*": "deny"
+    }
+  }
+}
