@@ -30,7 +30,7 @@ export class Broker {
   }
 
   async start() {
-    fs.mkdirSync(path.dirname(this.socketPath), { recursive: true });
+    fs.mkdirSync(path.dirname(this.socketPath), { recursive: true, mode: 0o700 });
     if (fs.existsSync(this.socketPath)) {
       throw new Error(
         `refusing to replace existing socket: ${this.socketPath}`
@@ -42,6 +42,9 @@ export class Broker {
       this.server.once("error", reject);
       this.server.listen(this.socketPath, resolve);
     });
+    // umask can still widen the socket's own bind-time mode even with a
+    // restricted parent dir on some platforms, so pin it explicitly.
+    fs.chmodSync(this.socketPath, 0o600);
   }
 
   async close() {
