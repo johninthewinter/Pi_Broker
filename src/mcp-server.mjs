@@ -222,13 +222,13 @@ server.registerTool(
   },
   async ({ target, requestId, decision, reason }) =>
     result(
-      await brokerCommand(
+      await brokerCommand([
         "permission-respond",
         target,
         requestId,
         decision,
         ...(reason ? [reason] : []),
-      ),
+      ]),
     ),
 );
 
