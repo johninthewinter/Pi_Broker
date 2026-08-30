@@ -16,9 +16,13 @@ import path from "node:path";
 import test from "node:test";
 import {
   DEFAULT_PI_COMMAND,
+  DEFAULT_TMUX_SESSION,
+  TMUX_BOOTSTRAP_WINDOW,
   assertSessionId,
   buildAppleScript,
   detectTerminal,
+  detectTmux,
+  ensureTmuxSession,
   isWsl,
   noTerminalMessage,
   openPiWindows,
@@ -69,10 +73,16 @@ test("Linux with no terminal emulator refuses, and says what to install", () => 
 });
 
 test("Linux with no graphical display refuses before looking for an emulator", () => {
+  // tmux is checked first regardless of DISPLAY (it needs no X server at
+  // all), but once it is confirmed absent, nothing else should be searched
+  // for before the DISPLAY guard refuses.
   const terminal = detectTerminal({
     platform: "linux",
     env: {},
-    which: () => assert.fail("must not search PATH with no display"),
+    which: (name) => {
+      assert.equal(name, "tmux", "must not search PATH for anything but tmux with no display");
+      return null;
+    },
   });
   assert.equal(terminal.kind, null);
   assert.match(terminal.reason, /DISPLAY/);
@@ -212,6 +222,153 @@ test("the PI_SESSION_OPEN test seam overrides detection on every platform", () =
     });
     assert.deepEqual(terminal, { kind: "custom", command: "/opt/fake-opener" });
   }
+});
+
+// --- tmux consolidation layer -------------------------------------------
+
+test("detectTmux reports found/not-found the same shape as every other detector", () => {
+  assert.deepEqual(detectTmux({ env: {}, which: whichOnly("tmux") }), {
+    kind: "tmux",
+    command: "/usr/bin/tmux",
+    sessionName: DEFAULT_TMUX_SESSION,
+  });
+  const missing = detectTmux({ env: {}, which: () => null });
+  assert.equal(missing.kind, null);
+  assert.match(missing.reason, /tmux is not installed/);
+});
+
+test("PI_BROKER_TMUX_SESSION overrides the default consolidated session name", () => {
+  const tmux = detectTmux({
+    env: { PI_BROKER_TMUX_SESSION: "my-pi-sessions" },
+    which: whichOnly("tmux"),
+  });
+  assert.equal(tmux.sessionName, "my-pi-sessions");
+});
+
+test("PI_BROKER_TERMINAL=auto (the default) prefers tmux when it is installed", () => {
+  const terminal = detectTerminal({
+    platform: "linux",
+    env: { DISPLAY: ":0" },
+    which: whichOnly("tmux", "xterm"),
+  });
+  assert.equal(terminal.kind, "tmux");
+});
+
+test("PI_BROKER_TERMINAL=auto falls back to the per-OS window path when tmux is absent", () => {
+  const terminal = detectTerminal({
+    platform: "linux",
+    env: { DISPLAY: ":0" },
+    which: whichOnly("xterm"),
+  });
+  assert.equal(terminal.kind, "emulator");
+  assert.equal(terminal.name, "xterm");
+});
+
+test("PI_BROKER_TERMINAL=window skips tmux even when it is installed", () => {
+  const terminal = detectTerminal({
+    platform: "linux",
+    env: { PI_BROKER_TERMINAL: "window", DISPLAY: ":0" },
+    which: whichOnly("tmux", "xterm"),
+  });
+  assert.equal(terminal.kind, "emulator");
+});
+
+test("PI_BROKER_TERMINAL=tmux is a hard requirement, not a silent fallback", () => {
+  const terminal = detectTerminal({
+    platform: "linux",
+    env: { PI_BROKER_TERMINAL: "tmux", DISPLAY: ":0" },
+    which: whichOnly("xterm"), // tmux itself missing
+  });
+  assert.equal(terminal.kind, null);
+  assert.match(terminal.reason, /PI_BROKER_TERMINAL=tmux was requested/);
+  const message = noTerminalMessage({
+    platform: "linux",
+    reason: terminal.reason,
+    socket: "/tmp/b.sock",
+    session: "session-a",
+  });
+  assert.match(message, /Install tmux/);
+  assert.doesNotMatch(message, /Install a terminal emulator/);
+});
+
+test("PI_SESSION_OPEN still overrides tmux detection (existing test seam wins)", () => {
+  const terminal = detectTerminal({
+    platform: "linux",
+    env: { PI_SESSION_OPEN: "/opt/fake-opener", DISPLAY: ":0" },
+    which: whichOnly("tmux"),
+  });
+  assert.deepEqual(terminal, { kind: "custom", command: "/opt/fake-opener" });
+});
+
+/** A fake `tmux` binary: logs every invocation, and fakes has-session state
+ * with a marker file so tests don't need a real tmux server. */
+function fakeTmux(dir) {
+  const tmuxPath = path.join(dir, "tmux");
+  fs.writeFileSync(
+    tmuxPath,
+    [
+      "#!/usr/bin/env bash",
+      `LOGDIR="${dir}"`,
+      'echo "$@" >>"$LOGDIR/tmux.log"',
+      'case "$1" in',
+      "  has-session)",
+      '    [ -f "$LOGDIR/session-exists" ] && exit 0 || exit 1',
+      "    ;;",
+      "  new-session)",
+      '    touch "$LOGDIR/session-exists"',
+      "    exit 0",
+      "    ;;",
+      "  *)",
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return tmuxPath;
+}
+
+test("ensureTmuxSession creates the session once, then reuses it", async (t) => {
+  const dir = tmpdir(t);
+  const tmuxCommand = fakeTmux(dir);
+  const first = await ensureTmuxSession({ tmuxCommand, sessionName: "pi-broker" });
+  assert.deepEqual(first, { sessionName: "pi-broker", created: true });
+  const second = await ensureTmuxSession({ tmuxCommand, sessionName: "pi-broker" });
+  assert.deepEqual(second, { sessionName: "pi-broker", created: false });
+  const log = fs.readFileSync(path.join(dir, "tmux.log"), "utf8").trim().split("\n");
+  assert.deepEqual(log, [
+    "has-session -t pi-broker",
+    `new-session -d -s pi-broker -n ${TMUX_BOOTSTRAP_WINDOW}`,
+    "has-session -t pi-broker",
+  ]);
+});
+
+test("openPiWindows on the tmux path creates the session once and a window per session", async (t) => {
+  const dir = tmpdir(t);
+  const tmuxCommand = fakeTmux(dir);
+  const entries = await openPiWindows({
+    root: "/repo",
+    runDir: dir,
+    socket: "/tmp/b.sock",
+    sessions: ["session-a", "session-b"],
+    platform: "linux",
+    env: {},
+    terminal: { kind: "tmux", command: tmuxCommand, sessionName: "pi-broker" },
+  });
+  assert.deepEqual(
+    entries.map((e) => e.session),
+    ["session-a", "session-b"],
+  );
+  const log = fs.readFileSync(path.join(dir, "tmux.log"), "utf8").trim().split("\n");
+  assert.equal(log[0], "has-session -t pi-broker");
+  assert.equal(log[1], `new-session -d -s pi-broker -n ${TMUX_BOOTSTRAP_WINDOW}`);
+  assert.match(log[2], /^new-window -t pi-broker: -n session-a bash /);
+  assert.match(log[2], new RegExp(path.join(dir, "session-a.sh")));
+  assert.match(log[3], /^new-window -t pi-broker: -n session-b bash /);
+  // Real launcher scripts were written, same as every other terminal kind.
+  assert.ok(fs.existsSync(path.join(dir, "session-a.sh")));
+  assert.ok(fs.existsSync(path.join(dir, "session-b.sh")));
 });
 
 // --- command construction ----------------------------------------------
