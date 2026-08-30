@@ -70,6 +70,8 @@ test("MCP exposes list, prompt, and interrupt over the broker", async () => {
     "pi_list",
     "pi_permission_respond",
     "pi_prompt",
+    "pi_slot_acquire",
+    "pi_slot_release",
   ]);
 
   const listed = await client.callTool({ name: "pi_list", arguments: {} });
@@ -95,6 +97,59 @@ test("MCP exposes list, prompt, and interrupt over the broker", async () => {
 
   await transport.close();
   agent.destroy();
+  await broker.close();
+  fs.rmdirSync(runtime);
+});
+
+test("MCP exposes pi_slot_acquire and pi_slot_release over the broker's resource lock", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-mcp-slots-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const broker = new Broker(socketPath, { slotConfig: { "local-mlx": 1 } });
+  await broker.start();
+
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.resolve("src/mcp-server.mjs"), socketPath],
+    cwd: path.resolve("."),
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "pi-broker-slot-test", version: "0.1.0" });
+  await client.connect(transport);
+
+  const acquired = await client.callTool({
+    name: "pi_slot_acquire",
+    arguments: { resource: "local-mlx", holderId: "orchestrator-a" },
+  });
+  assert.deepEqual(acquired.structuredContent, {
+    granted: true,
+    resource: "local-mlx",
+  });
+
+  const deniedImmediate = await client.callTool({
+    name: "pi_slot_acquire",
+    arguments: { resource: "local-mlx", holderId: "orchestrator-b" },
+  });
+  assert.deepEqual(deniedImmediate.structuredContent, {
+    granted: false,
+    resource: "local-mlx",
+  });
+
+  const released = await client.callTool({
+    name: "pi_slot_release",
+    arguments: { resource: "local-mlx", holderId: "orchestrator-a" },
+  });
+  assert.deepEqual(released.structuredContent, { released: true });
+
+  const acquiredAfterRelease = await client.callTool({
+    name: "pi_slot_acquire",
+    arguments: { resource: "local-mlx", holderId: "orchestrator-b" },
+  });
+  assert.deepEqual(acquiredAfterRelease.structuredContent, {
+    granted: true,
+    resource: "local-mlx",
+  });
+
+  await transport.close();
   await broker.close();
   fs.rmdirSync(runtime);
 });

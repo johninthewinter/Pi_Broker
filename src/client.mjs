@@ -4,7 +4,7 @@ import { permissionRespondMessage } from "./protocol.mjs";
 const [socketPath, command, target, ...rest] = process.argv.slice(2);
 if (!socketPath || !command) {
   process.stderr.write(
-    "usage: node src/client.mjs <socket> list|prompt|interrupt <target> [text]\n" +
+    "usage: node src/client.mjs <socket> list|prompt|interrupt|acquire|release <target> [text]\n" +
       "       node src/client.mjs <socket> permission-respond <target> <requestId> allow|deny|defer [reason]\n",
   );
   process.exit(2);
@@ -75,6 +75,30 @@ socket.on("data", (chunk) => {
             reason.length ? reason.join(" ") : undefined,
           ),
         );
+      } else if (command === "acquire") {
+        // positional: <resource> <holderId> [waitMs]
+        const [holderId, waitMsRaw] = rest;
+        if (!target || !holderId)
+          throw new Error("acquire requires resource and holderId");
+        const waitMs = waitMsRaw ? Number(waitMsRaw) : undefined;
+        write({
+          type: "acquire",
+          id: requestId,
+          resource: target,
+          holderId,
+          ...(waitMs ? { waitMs } : {}),
+        });
+      } else if (command === "release") {
+        // positional: <resource> <holderId>
+        const [holderId] = rest;
+        if (!target || !holderId)
+          throw new Error("release requires resource and holderId");
+        write({
+          type: "release",
+          id: requestId,
+          resource: target,
+          holderId,
+        });
       } else {
         throw new Error(`unknown command: ${command}`);
       }
@@ -106,6 +130,14 @@ socket.on("data", (chunk) => {
         requestId: rest[0],
         decision: rest[1],
       });
+      return;
+    }
+    if (command === "acquire" && message.id === requestId) {
+      finish({ granted: message.granted, resource: message.resource });
+      return;
+    }
+    if (command === "release" && message.id === requestId) {
+      finish({ released: message.released, resource: message.resource });
       return;
     }
     if (command === "prompt" && message.sessionId === target) {
