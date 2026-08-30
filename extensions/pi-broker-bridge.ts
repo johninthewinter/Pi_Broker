@@ -4,13 +4,69 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
+type PermissionDecision = "allow" | "deny" | "defer";
+
 type BrokerCommand = {
   type: "command";
   id?: string;
-  action: "prompt" | "interrupt" | "shutdown";
+  action: "prompt" | "interrupt" | "shutdown" | "permission_respond";
   text?: string;
   delivery?: "steer" | "followUp";
+  requestId?: string;
+  decision?: PermissionDecision;
+  reason?: string;
 };
+
+// The subset of @gotgenes/pi-permission-system's authorizer-chain contract this
+// bridge depends on. Declared structurally rather than imported as types so a
+// Pi install without the permission system still type-checks and loads; the
+// real service is picked up at runtime by dynamic import (see
+// registerBrokerAuthorizer).
+type AuthorizerVerdict =
+  | { kind: "allow" }
+  | { kind: "deny"; reason?: string }
+  | { kind: "defer" };
+
+type PromptPermissionDetails = {
+  requestId: string;
+  source: "tool_call" | "skill_input" | "skill_read";
+  agentName: string | null;
+  message: string;
+  toolName?: string;
+  skillName?: string;
+  path?: string;
+  command?: string;
+  target?: string;
+  toolInputPreview?: string;
+  surface?: string | null;
+  value?: string | null;
+  accessIntent?: { surface: string };
+};
+
+type PermissionsService = {
+  registerAuthorizer(
+    name: string,
+    authorize: (
+      details: PromptPermissionDetails,
+      query: unknown,
+      log: unknown,
+    ) => Promise<AuthorizerVerdict>,
+  ): () => void;
+};
+
+// How long a pending `ask` waits on the controller before the bridge hands it
+// back to the human. This is a hand-back window, not a race: the permission
+// system's chain is sequential (composeAuthorizerChain awaits each link, then
+// falls through to the terminal LocalUserAuthorizer), so the TUI prompt is not
+// yet on screen while the controller is thinking. Keep it short enough that an
+// unattended controller does not strand the operator staring at an idle TUI.
+const PERMISSION_WAIT_MS =
+  Number(process.env.PI_BROKER_PERMISSION_TIMEOUT_MS) || 120000;
+
+// The name the operator must list in the permission system's `authorizerChain`
+// config for this link to have any authority at all. Registration alone grants
+// nothing (ADR 0007 invariant 3).
+const AUTHORIZER_NAME = "pi-broker";
 
 export default function piBrokerBridge(pi: ExtensionAPI) {
   const socketPath = process.env.PI_BROKER_SOCKET;
@@ -25,9 +81,43 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
   // that settled having made zero tool calls — a free, literal
   // "settle-without-tool-call" incident signal.
   let toolCallsSinceAgentStart = 0;
+  // Asks currently blocked inside the authorizer link, keyed by the permission
+  // system's own requestId. An entry lives only for the duration of one
+  // authorize() call; settle() is idempotent so a duplicate or late controller
+  // answer is dropped rather than resolving a second, unrelated ask.
+  const pendingPermissions = new Map<
+    string,
+    (verdict: AuthorizerVerdict) => void
+  >();
+  let disposeAuthorizer: (() => void) | undefined;
 
   function send(value: unknown) {
     if (socket?.writable) socket.write(`${JSON.stringify(value)}\n`);
+  }
+
+  function respondToPermission(command: BrokerCommand) {
+    const { requestId, decision } = command;
+    if (!requestId || !decision) return;
+    const settle = pendingPermissions.get(requestId);
+    if (!settle) {
+      // The ask is already gone — the human clicked first, or it timed out and
+      // was handed back. Say so explicitly so the controller learns its verdict
+      // did not land instead of assuming silence meant success.
+      send({
+        type: "event",
+        event: "permission_request_resolved",
+        requestId,
+        decision,
+        applied: false,
+        resolvedBy: "unknown",
+        emittedAt: Date.now(),
+      });
+      return;
+    }
+    if (decision === "allow") settle({ kind: "allow" });
+    else if (decision === "deny")
+      settle({ kind: "deny", reason: command.reason });
+    else settle({ kind: "defer" });
   }
 
   function handle(command: BrokerCommand) {
@@ -46,7 +136,138 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
       context?.abort();
       return;
     }
+    if (command.action === "permission_respond") {
+      respondToPermission(command);
+      return;
+    }
     if (command.action === "shutdown") context?.shutdown();
+  }
+
+  /**
+   * The live-permission link. Registered with the permission system's
+   * authorizer chain, so it is consulted on every `ask` *before* the terminal
+   * authorizer (the human's TUI prompt) is reached.
+   *
+   * Returning `defer` — on timeout, on a disconnected broker, or because the
+   * controller said so — falls the ask through to that terminal, which is what
+   * keeps the local operator's own Yes/No button working. The bridge only ever
+   * answers *ahead of* the human; it never removes them from the loop.
+   *
+   * Note the permission system caps this link with its bounded-delegation
+   * envelope: an `allow` on the `path` or `external_directory` surface is
+   * downgraded to `defer` by the chain owner, so those asks always reach the
+   * human no matter what the controller says. `deny` is never capped.
+   */
+  async function authorizeViaBroker(
+    details: PromptPermissionDetails,
+  ): Promise<AuthorizerVerdict> {
+    if (!socket?.writable) return { kind: "defer" };
+
+    const { requestId } = details;
+    send({
+      type: "event",
+      event: "permission_request",
+      requestId,
+      source: details.source,
+      surface: details.accessIntent?.surface ?? details.surface ?? null,
+      value: details.value ?? null,
+      agentName: details.agentName,
+      message: details.message,
+      toolName: details.toolName,
+      skillName: details.skillName,
+      path: details.path,
+      command: details.command,
+      target: details.target,
+      toolInputPreview: details.toolInputPreview,
+      timeoutMs: PERMISSION_WAIT_MS,
+      emittedAt: Date.now(),
+    });
+
+    const verdict = await new Promise<AuthorizerVerdict>((resolve) => {
+      let done = false;
+      const settle = (value: AuthorizerVerdict) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        pendingPermissions.delete(requestId);
+        resolve(value);
+      };
+      const timer = setTimeout(
+        () => settle({ kind: "defer" }),
+        PERMISSION_WAIT_MS,
+      );
+      // Never hold the session's event loop open on an unanswered ask.
+      timer.unref?.();
+      pendingPermissions.set(requestId, settle);
+    });
+
+    send({
+      type: "event",
+      event: "permission_request_resolved",
+      requestId,
+      decision: verdict.kind,
+      applied: verdict.kind !== "defer",
+      // A `defer` is the hand-back: from here the human's TUI prompt decides.
+      resolvedBy: verdict.kind === "defer" ? "human" : "controller",
+      reason: verdict.kind === "deny" ? verdict.reason : undefined,
+      emittedAt: Date.now(),
+    });
+    return verdict;
+  }
+
+  /**
+   * Get the running permission system's published service.
+   *
+   * Preferred path is the package's own `getPermissionsService()` accessor.
+   * The package's `.` export points at a `.ts` source file, so that import
+   * only resolves under a TS-aware loader (jiti, which is what Pi loads
+   * extensions with) — under a plain-Node loader it throws. The fallback reads
+   * the very slot that accessor reads: the service is published onto
+   * `globalThis` under `Symbol.for("@gotgenes/pi-permission-system:service")`,
+   * deliberately process-global so it survives jiti's per-extension module
+   * registry. Same instance either way; the fallback just needs no module
+   * resolution.
+   */
+  async function resolvePermissionsService(): Promise<
+    PermissionsService | undefined
+  > {
+    try {
+      const mod = (await import("@gotgenes/pi-permission-system")) as {
+        getPermissionsService?: () => PermissionsService | undefined;
+      };
+      const service = mod.getPermissionsService?.();
+      if (service) return service;
+    } catch {
+      // Fall through to the globalThis slot.
+    }
+    const slot = (globalThis as Record<symbol, unknown>)[
+      Symbol.for("@gotgenes/pi-permission-system:service")
+    ];
+    return slot as PermissionsService | undefined;
+  }
+
+  async function registerBrokerAuthorizer() {
+    // permissions:ready re-fires on /reload. Drop any prior registration first
+    // — the package's disposer is identity-guarded, so this is a no-op against
+    // a fresh registry and prevents the duplicate-name throw against a
+    // surviving one.
+    disposeAuthorizer?.();
+    disposeAuthorizer = undefined;
+    try {
+      const service = await resolvePermissionsService();
+      if (!service) return;
+      disposeAuthorizer = service.registerAuthorizer(
+        AUTHORIZER_NAME,
+        (details) => authorizeViaBroker(details),
+      );
+    } catch (error) {
+      context?.ui.notify(
+        `Pi Broker could not register its permission authorizer: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        "warning",
+      );
+    }
   }
 
   function connect() {
@@ -213,8 +434,37 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
+    // Hand every still-blocked ask back to the terminal authorizer before the
+    // socket goes away, so a shutdown mid-ask cannot wedge the session.
+    for (const settle of pendingPermissions.values()) settle({ kind: "defer" });
+    pendingPermissions.clear();
+    disposeAuthorizer?.();
+    disposeAuthorizer = undefined;
     send({ type: "event", event: "session_shutdown" });
     socket?.end();
+  });
+
+  // Registration point per the permission system's own guidance: registering
+  // from permissions:ready is robust to extension load order and survives
+  // /reload (which re-publishes a fresh service and re-fires this event).
+  pi.events.on("permissions:ready", () => {
+    void registerBrokerAuthorizer();
+  });
+
+  // The moment the ask reaches the human's prompt — i.e. this bridge deferred,
+  // or was never in the chain. Forwarded so a controller watching a session can
+  // tell "waiting on me" (permission_request) from "waiting on the operator".
+  pi.events.on("permissions:ui_prompt", (prompt: Record<string, unknown>) => {
+    send({
+      type: "event",
+      event: "permission_ui_prompt",
+      requestId: prompt.requestId,
+      surface: prompt.surface,
+      value: prompt.value,
+      agentName: prompt.agentName,
+      message: prompt.message,
+      emittedAt: Date.now(),
+    });
   });
 
   pi.events.on("permissions:decision", (decision: Record<string, unknown>) => {

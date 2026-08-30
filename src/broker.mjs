@@ -153,7 +153,14 @@ export class Broker {
         agent,
         commandMessage(message.id, message.action, {
           text: message.text,
-          delivery: message.delivery
+          delivery: message.delivery,
+          // The permission-answer payload. Carried on the same send->command
+          // relay as prompt/interrupt rather than a parallel channel, so a
+          // controller's verdict is ordered against that session's other
+          // commands instead of racing them.
+          requestId: message.requestId,
+          decision: message.decision,
+          reason: message.reason
         })
       );
       writeJson(socket, responseMessage(message.id, { accepted: true }));

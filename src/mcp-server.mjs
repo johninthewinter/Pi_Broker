@@ -87,6 +87,40 @@ server.registerTool(
   async ({ target }) => result(await brokerCommand("interrupt", target)),
 );
 
+server.registerTool(
+  "pi_permission_respond",
+  {
+    description:
+      "Answer a permission request a live Pi session is currently blocked on. " +
+      "Use the requestId from that session's permission_request event. " +
+      "'allow' and 'deny' settle the request; 'defer' hands it back to the human " +
+      "at the terminal, whose own Yes/No prompt then decides. Requires the Pi " +
+      "session to list 'pi-broker' in its permission authorizerChain config.",
+    inputSchema: {
+      target: sessionId,
+      requestId: z.string().min(1),
+      decision: z.enum(["allow", "deny", "defer"]),
+      reason: z.string().optional(),
+    },
+    outputSchema: {
+      target: z.string(),
+      requestId: z.string(),
+      decision: z.string(),
+      accepted: z.boolean(),
+    },
+  },
+  async ({ target, requestId, decision, reason }) =>
+    result(
+      await brokerCommand(
+        "permission-respond",
+        target,
+        requestId,
+        decision,
+        ...(reason ? [reason] : []),
+      ),
+    ),
+);
+
 // Startup half of the hybrid: guarantee a broker exists before the host can
 // call anything. Cheap, idempotent, and opens no window — a host that connects
 // and never delegates costs nothing visible. The window is opened later, by

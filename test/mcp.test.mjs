@@ -68,6 +68,7 @@ test("MCP exposes list, prompt, and interrupt over the broker", async () => {
   assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
     "pi_interrupt",
     "pi_list",
+    "pi_permission_respond",
     "pi_prompt",
   ]);
 

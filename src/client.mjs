@@ -1,9 +1,11 @@
 import net from "node:net";
+import { permissionRespondMessage } from "./protocol.mjs";
 
 const [socketPath, command, target, ...rest] = process.argv.slice(2);
 if (!socketPath || !command) {
   process.stderr.write(
-    "usage: node src/client.mjs <socket> list|prompt|interrupt <target> [text]\n",
+    "usage: node src/client.mjs <socket> list|prompt|interrupt <target> [text]\n" +
+      "       node src/client.mjs <socket> permission-respond <target> <requestId> allow|deny|defer [reason]\n",
   );
   process.exit(2);
 }
@@ -58,6 +60,21 @@ socket.on("data", (chunk) => {
       } else if (command === "interrupt") {
         if (!target) throw new Error("interrupt requires target");
         write({ type: "send", id: requestId, target, action: "interrupt" });
+      } else if (command === "permission-respond") {
+        const [permissionRequestId, decision, ...reason] = rest;
+        if (!target || !permissionRequestId || !decision)
+          throw new Error(
+            "permission-respond requires target, requestId and decision",
+          );
+        write(
+          permissionRespondMessage(
+            requestId,
+            target,
+            permissionRequestId,
+            decision,
+            reason.length ? reason.join(" ") : undefined,
+          ),
+        );
       } else {
         throw new Error(`unknown command: ${command}`);
       }
@@ -76,6 +93,19 @@ socket.on("data", (chunk) => {
     }
     if (command === "interrupt" && message.id === requestId) {
       finish({ accepted: message.accepted, target });
+      return;
+    }
+    if (command === "permission-respond" && message.id === requestId) {
+      // `accepted` is delivery, not adjudication: the broker confirms the
+      // verdict reached the session. Whether it actually settled the ask (vs.
+      // arriving after the human already clicked) comes back as the session's
+      // own permission_request_resolved event.
+      finish({
+        accepted: message.accepted,
+        target,
+        requestId: rest[0],
+        decision: rest[1],
+      });
       return;
     }
     if (command === "prompt" && message.sessionId === target) {
