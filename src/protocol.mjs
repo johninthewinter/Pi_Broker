@@ -37,6 +37,12 @@ export function validateMessage(message) {
 		case "command":
 			required(message, ["id", "action"]);
 			break;
+		case "acquire":
+			required(message, ["id", "resource", "holderId"]);
+			break;
+		case "release":
+			required(message, ["id", "resource", "holderId"]);
+			break;
 		case "response":
 			required(message, ["id"]);
 			break;
@@ -85,6 +91,19 @@ export const commandMessage = (id, action, fields = {}) => ({
 	action,
 	...fields,
 });
+export const acquireMessage = (id, resource, holderId, fields = {}) => ({
+	type: "acquire",
+	id,
+	resource,
+	holderId,
+	...fields,
+});
+export const releaseMessage = (id, resource, holderId) => ({
+	type: "release",
+	id,
+	resource,
+	holderId,
+});
 export const responseMessage = (id, fields = {}) => ({
 	type: "response",
 	id,
@@ -110,6 +129,10 @@ export const isSendMessage = (message) =>
 	isValidMessage(message) && message.type === "send";
 export const isCommandMessage = (message) =>
 	isValidMessage(message) && message.type === "command";
+export const isAcquireMessage = (message) =>
+	isValidMessage(message) && message.type === "acquire";
+export const isReleaseMessage = (message) =>
+	isValidMessage(message) && message.type === "release";
 export const isResponseMessage = (message) =>
 	isValidMessage(message) && message.type === "response";
 export const isErrorMessage = (message) =>
