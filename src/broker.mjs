@@ -10,6 +10,7 @@ import {
   parseMessage,
   responseMessage
 } from "./protocol.mjs";
+import { readSlotConfig } from "./slots.mjs";
 import { LangfuseTracer } from "./langfuse-tracing.mjs";
 
 function writeJson(socket, value) {
@@ -17,7 +18,7 @@ function writeJson(socket, value) {
 }
 
 export class Broker {
-  constructor(socketPath, { tracer } = {}) {
+  constructor(socketPath, { tracer, slotConfig } = {}) {
     this.socketPath = socketPath;
     this.server = null;
     this.agents = new Map();
@@ -27,6 +28,20 @@ export class Broker {
     // when unset/unconfigured — see langfuse-tracing.mjs for the contract:
     // record() never throws and never blocks #broadcast.
     this.tracer = tracer ?? new LangfuseTracer();
+
+    // resource -> { max, holders: Map<holderId, socket>, queue: [] }
+    // queue entries: { holderId, socket, id, timer, settled }
+    this.slotConfig = slotConfig ?? readSlotConfig();
+    this.slots = new Map();
+  }
+
+  #slotState(resource) {
+    let state = this.slots.get(resource);
+    if (!state) {
+      state = { holders: new Map(), queue: [] };
+      this.slots.set(resource, state);
+    }
+    return state;
   }
 
   async start() {
@@ -91,7 +106,116 @@ export class Broker {
       }
       if (socket._piBrokerRole === "controller")
         this.controllers.delete(socket);
+
+      // Deadlock prevention: a crashed/exited orchestrator must not
+      // permanently strand a resource it never explicitly released.
+      this.#autoReleaseAll(socket);
     });
+  }
+
+  // --- slot/license arbiter -------------------------------------------
+
+  #autoReleaseAll(socket) {
+    for (const [resource, state] of this.slots) {
+      for (const [holderId, holderSocket] of state.holders) {
+        if (holderSocket === socket) {
+          state.holders.delete(holderId);
+          this.#broadcastSlotStatus(resource);
+          this.#grantNextQueued(resource);
+        }
+      }
+    }
+  }
+
+  #broadcastSlotStatus(resource) {
+    const state = this.#slotState(resource);
+    this.#broadcast(
+      eventMessage("slot_status", {
+        cursor: ++this.cursor,
+        resource,
+        held: state.holders.size,
+        max: this.slotConfig[resource],
+        waiting: state.queue.length
+      })
+    );
+  }
+
+  #grantNextQueued(resource) {
+    const state = this.#slotState(resource);
+    const max = this.slotConfig[resource];
+    while (state.queue.length > 0 && state.holders.size < max) {
+      const waiter = state.queue.shift();
+      if (waiter.settled) continue; // already timed out
+      waiter.settled = true;
+      clearTimeout(waiter.timer);
+      state.holders.set(waiter.holderId, waiter.socket);
+      writeJson(
+        waiter.socket,
+        responseMessage(waiter.id, { granted: true, resource })
+      );
+      this.#broadcastSlotStatus(resource);
+    }
+  }
+
+  #acquire(socket, message) {
+    const { id, resource, holderId, waitMs } = message;
+    if (!(resource in this.slotConfig)) {
+      throw new Error(
+        `unknown resource: ${resource} (not configured in PI_BROKER_SLOTS)`
+      );
+    }
+    const max = this.slotConfig[resource];
+    const state = this.#slotState(resource);
+
+    if (state.holders.has(holderId)) {
+      // Idempotent re-acquire by the same holder on the same resource.
+      writeJson(socket, responseMessage(id, { granted: true, resource }));
+      return;
+    }
+
+    if (state.holders.size < max) {
+      state.holders.set(holderId, socket);
+      writeJson(socket, responseMessage(id, { granted: true, resource }));
+      this.#broadcastSlotStatus(resource);
+      return;
+    }
+
+    const wait = Number(waitMs) || 0;
+    if (wait <= 0) {
+      writeJson(socket, responseMessage(id, { granted: false, resource }));
+      return;
+    }
+
+    const waiter = {
+      holderId,
+      socket,
+      id,
+      settled: false,
+      timer: null
+    };
+    waiter.timer = setTimeout(() => {
+      if (waiter.settled) return;
+      waiter.settled = true;
+      const index = state.queue.indexOf(waiter);
+      if (index !== -1) state.queue.splice(index, 1);
+      writeJson(socket, responseMessage(id, { granted: false, resource }));
+    }, wait);
+    waiter.timer.unref?.();
+    state.queue.push(waiter);
+    // No response yet: the request stays open until a slot frees (grant)
+    // or waitMs elapses (deny) — see #grantNextQueued and the timer above.
+  }
+
+  #release(socket, message) {
+    const { id, resource, holderId } = message;
+    const state = this.slots.get(resource);
+    const held = state?.holders.get(holderId) === socket;
+    if (held) {
+      state.holders.delete(holderId);
+      this.#broadcastSlotStatus(resource);
+      this.#grantNextQueued(resource);
+    }
+    writeJson(socket, responseMessage(id, { released: held, resource }));
   }
 
   #message(socket, message) {
@@ -153,10 +277,27 @@ export class Broker {
         agent,
         commandMessage(message.id, message.action, {
           text: message.text,
-          delivery: message.delivery
+          delivery: message.delivery,
+          // The permission-answer payload. Carried on the same send->command
+          // relay as prompt/interrupt rather than a parallel channel, so a
+          // controller's verdict is ordered against that session's other
+          // commands instead of racing them.
+          requestId: message.requestId,
+          decision: message.decision,
+          reason: message.reason
         })
       );
       writeJson(socket, responseMessage(message.id, { accepted: true }));
+      return;
+    }
+
+    if (message.type === "acquire") {
+      this.#acquire(socket, message);
+      return;
+    }
+
+    if (message.type === "release") {
+      this.#release(socket, message);
       return;
     }
 

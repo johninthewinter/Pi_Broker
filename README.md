@@ -70,6 +70,36 @@ So a human can type a correction into the same session mid-delegation, the
 orchestrator can see that a human turn arrived and adjust, and no one is
 reconstructing what happened from a log afterwards.
 
+### Answering a permission prompt, not just watching one
+
+`permission_decision` is an after-the-fact report. When a session's policy lands
+on `ask`, the bridge can also *answer* it: it registers a link named `pi-broker`
+on `@gotgenes/pi-permission-system`'s authorizer chain, emits a
+`permission_request` event carrying the `requestId`, `surface` and `value`, and
+blocks that one request until a controller calls `pi_permission_respond` with
+`allow`, `deny`, or `defer`.
+
+The human never loses their button. The chain is sequential, so this is a
+**hand-back window, not a race**: while the controller is deciding, the TUI
+prompt has not yet appeared; on `defer` — or after
+`PI_BROKER_PERMISSION_TIMEOUT_MS` (default 120000) elapses with no answer — the
+request falls through to the terminal authorizer and the operator's ordinary
+Yes/No prompt appears exactly as it would without this feature. A
+`permission_request_resolved` event reports which way each request went, and
+`permission_ui_prompt` tells the controller when a request has reached the human.
+
+This is opt-in twice over. Registration alone grants no authority: the session's
+permission config must name the link.
+
+```jsonc
+{ "authorizerChain": ["pi-broker"] }
+```
+
+The permission system also caps the link with its bounded-delegation
+checkpoint — an `allow` on the `path` or `external_directory` surface is
+downgraded to `defer`, so those requests always reach the human no matter what
+the controller answers. `deny` is never capped.
+
 ```mermaid
 sequenceDiagram
     autonumber

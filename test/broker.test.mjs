@@ -254,6 +254,247 @@ test("pi-broker prompt prints the agent response and exits successfully", async 
   fs.rmdirSync(runtime);
 });
 
+test("acquire on a free resource grants immediately", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-test-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const broker = new Broker(socketPath, { slotConfig: { "local-mlx": 1 } });
+  await broker.start();
+
+  const controller = peer(socketPath);
+  controller.socket.write('{"type":"register","role":"controller"}\n');
+  await waitFor(() =>
+    controller.messages.find((item) => item.type === "registered"),
+  );
+
+  controller.socket.write(
+    '{"type":"acquire","id":"acq-1","resource":"local-mlx","holderId":"alpha"}\n',
+  );
+  const granted = await waitFor(() =>
+    controller.messages.find((item) => item.id === "acq-1"),
+  );
+  assert.equal(granted.granted, true);
+  assert.equal(granted.resource, "local-mlx");
+
+  controller.socket.destroy();
+  await broker.close();
+  fs.rmdirSync(runtime);
+});
+
+test("acquire on a full resource with no waitMs is denied immediately", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-test-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const broker = new Broker(socketPath, { slotConfig: { "local-mlx": 1 } });
+  await broker.start();
+
+  const holder = peer(socketPath);
+  const waiter = peer(socketPath);
+  holder.socket.write('{"type":"register","role":"controller"}\n');
+  waiter.socket.write('{"type":"register","role":"controller"}\n');
+  await waitFor(() =>
+    holder.messages.find((item) => item.type === "registered"),
+  );
+  await waitFor(() =>
+    waiter.messages.find((item) => item.type === "registered"),
+  );
+
+  holder.socket.write(
+    '{"type":"acquire","id":"acq-holder","resource":"local-mlx","holderId":"alpha"}\n',
+  );
+  await waitFor(() => holder.messages.find((item) => item.id === "acq-holder"));
+
+  waiter.socket.write(
+    '{"type":"acquire","id":"acq-waiter","resource":"local-mlx","holderId":"beta"}\n',
+  );
+  const denied = await waitFor(() =>
+    waiter.messages.find((item) => item.id === "acq-waiter"),
+  );
+  assert.equal(denied.granted, false);
+
+  holder.socket.destroy();
+  waiter.socket.destroy();
+  await broker.close();
+  fs.rmdirSync(runtime);
+});
+
+test("acquire on a full resource with waitMs grants once the holder releases before timeout", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-test-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const broker = new Broker(socketPath, { slotConfig: { "local-mlx": 1 } });
+  await broker.start();
+
+  const holder = peer(socketPath);
+  const waiter = peer(socketPath);
+  holder.socket.write('{"type":"register","role":"controller"}\n');
+  waiter.socket.write('{"type":"register","role":"controller"}\n');
+  await waitFor(() =>
+    holder.messages.find((item) => item.type === "registered"),
+  );
+  await waitFor(() =>
+    waiter.messages.find((item) => item.type === "registered"),
+  );
+
+  holder.socket.write(
+    '{"type":"acquire","id":"acq-holder","resource":"local-mlx","holderId":"alpha"}\n',
+  );
+  await waitFor(() => holder.messages.find((item) => item.id === "acq-holder"));
+
+  waiter.socket.write(
+    '{"type":"acquire","id":"acq-waiter","resource":"local-mlx","holderId":"beta","waitMs":5000}\n',
+  );
+  // Give the broker a moment to queue the waiter before releasing, so this
+  // actually proves the queued-then-granted path, not just an immediate grant.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(
+    waiter.messages.some((item) => item.id === "acq-waiter"),
+    false,
+  );
+
+  holder.socket.write(
+    '{"type":"release","id":"rel-1","resource":"local-mlx","holderId":"alpha"}\n',
+  );
+
+  const granted = await waitFor(() =>
+    waiter.messages.find((item) => item.id === "acq-waiter"),
+  );
+  assert.equal(granted.granted, true);
+
+  holder.socket.destroy();
+  waiter.socket.destroy();
+  await broker.close();
+  fs.rmdirSync(runtime);
+});
+
+test("acquire on a full resource with waitMs is denied after timing out with no release", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-test-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const broker = new Broker(socketPath, { slotConfig: { "local-mlx": 1 } });
+  await broker.start();
+
+  const holder = peer(socketPath);
+  const waiter = peer(socketPath);
+  holder.socket.write('{"type":"register","role":"controller"}\n');
+  waiter.socket.write('{"type":"register","role":"controller"}\n');
+  await waitFor(() =>
+    holder.messages.find((item) => item.type === "registered"),
+  );
+  await waitFor(() =>
+    waiter.messages.find((item) => item.type === "registered"),
+  );
+
+  holder.socket.write(
+    '{"type":"acquire","id":"acq-holder","resource":"local-mlx","holderId":"alpha"}\n',
+  );
+  await waitFor(() => holder.messages.find((item) => item.id === "acq-holder"));
+
+  waiter.socket.write(
+    '{"type":"acquire","id":"acq-waiter","resource":"local-mlx","holderId":"beta","waitMs":150}\n',
+  );
+  const denied = await waitFor(
+    () => waiter.messages.find((item) => item.id === "acq-waiter"),
+    2000,
+  );
+  assert.equal(denied.granted, false);
+
+  holder.socket.destroy();
+  waiter.socket.destroy();
+  await broker.close();
+  fs.rmdirSync(runtime);
+});
+
+test("a holder's socket disconnecting auto-releases its slot and lets a queued waiter through", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-test-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const broker = new Broker(socketPath, { slotConfig: { "local-mlx": 1 } });
+  await broker.start();
+
+  const holder = peer(socketPath);
+  const waiter = peer(socketPath);
+  holder.socket.write('{"type":"register","role":"controller"}\n');
+  waiter.socket.write('{"type":"register","role":"controller"}\n');
+  await waitFor(() =>
+    holder.messages.find((item) => item.type === "registered"),
+  );
+  await waitFor(() =>
+    waiter.messages.find((item) => item.type === "registered"),
+  );
+
+  holder.socket.write(
+    '{"type":"acquire","id":"acq-holder","resource":"local-mlx","holderId":"alpha"}\n',
+  );
+  await waitFor(() => holder.messages.find((item) => item.id === "acq-holder"));
+
+  waiter.socket.write(
+    '{"type":"acquire","id":"acq-waiter","resource":"local-mlx","holderId":"beta","waitMs":5000}\n',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  holder.socket.destroy();
+
+  const granted = await waitFor(() =>
+    waiter.messages.find((item) => item.id === "acq-waiter"),
+  );
+  assert.equal(granted.granted, true);
+
+  waiter.socket.destroy();
+  await broker.close();
+  fs.rmdirSync(runtime);
+});
+
+test("acquire on an unconfigured resource is rejected with a clear error", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-test-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const broker = new Broker(socketPath, { slotConfig: { "local-mlx": 1 } });
+  await broker.start();
+
+  const controller = peer(socketPath);
+  controller.socket.write('{"type":"register","role":"controller"}\n');
+  await waitFor(() =>
+    controller.messages.find((item) => item.type === "registered"),
+  );
+
+  controller.socket.write(
+    '{"type":"acquire","id":"acq-1","resource":"unknown-thing","holderId":"alpha"}\n',
+  );
+  const error = await waitFor(() =>
+    controller.messages.find((item) => item.type === "error"),
+  );
+  assert.match(error.error, /unknown resource/);
+
+  controller.socket.destroy();
+  await broker.close();
+  fs.rmdirSync(runtime);
+});
+
+test("release frees a holder's slot and reports released:true", async () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-test-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const broker = new Broker(socketPath, { slotConfig: { "local-mlx": 1 } });
+  await broker.start();
+
+  const controller = peer(socketPath);
+  controller.socket.write('{"type":"register","role":"controller"}\n');
+  await waitFor(() =>
+    controller.messages.find((item) => item.type === "registered"),
+  );
+
+  controller.socket.write(
+    '{"type":"acquire","id":"acq-1","resource":"local-mlx","holderId":"alpha"}\n',
+  );
+  await waitFor(() => controller.messages.find((item) => item.id === "acq-1"));
+
+  controller.socket.write(
+    '{"type":"release","id":"rel-1","resource":"local-mlx","holderId":"alpha"}\n',
+  );
+  const released = await waitFor(() =>
+    controller.messages.find((item) => item.id === "rel-1"),
+  );
+  assert.equal(released.released, true);
+
+  controller.socket.destroy();
+  await broker.close();
+  fs.rmdirSync(runtime);
+});
+
 test("pi-broker rejects an invalid subcommand with usage and exit code 2", async () => {
   const { code, stderr } = await execFileWithExitCode(
     process.execPath,

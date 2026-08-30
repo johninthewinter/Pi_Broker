@@ -14,6 +14,25 @@ const required = (message, fields) => {
 	}
 };
 
+// The live-permission seam. A Pi session whose permission policy lands on
+// "ask" escalates through @gotgenes/pi-permission-system's authorizer chain
+// (ADR 0007); the bridge registers a link there, emits PERMISSION_REQUEST_EVENT
+// broker-ward, and blocks that one ask until a controller answers with a
+// `send`/`command` carrying PERMISSION_RESPOND_ACTION. "defer" is the
+// hand-back: it falls through to the terminal authorizer, i.e. the human's
+// ordinary TUI prompt, so the local operator never loses their button.
+export const PERMISSION_REQUEST_EVENT = "permission_request";
+export const PERMISSION_RESPOND_ACTION = "permission_respond";
+export const PERMISSION_DECISIONS = ["allow", "deny", "defer"];
+
+const requirePermissionVerdict = (message) => {
+	required(message, ["requestId", "decision"]);
+	if (!PERMISSION_DECISIONS.includes(message.decision))
+		throw new Error(
+			`permission decision must be one of ${PERMISSION_DECISIONS.join(", ")}`,
+		);
+};
+
 export function validateMessage(message) {
 	if (!isRecord(message) || typeof message.type !== "string" || !message.type) {
 		throw new Error("message requires a type");
@@ -33,9 +52,19 @@ export function validateMessage(message) {
 			break;
 		case "send":
 			required(message, ["id", "target", "action"]);
+			if (message.action === PERMISSION_RESPOND_ACTION)
+				requirePermissionVerdict(message);
 			break;
 		case "command":
 			required(message, ["id", "action"]);
+			if (message.action === PERMISSION_RESPOND_ACTION)
+				requirePermissionVerdict(message);
+			break;
+		case "acquire":
+			required(message, ["id", "resource", "holderId"]);
+			break;
+		case "release":
+			required(message, ["id", "resource", "holderId"]);
 			break;
 		case "response":
 			required(message, ["id"]);
@@ -85,12 +114,42 @@ export const commandMessage = (id, action, fields = {}) => ({
 	action,
 	...fields,
 });
+export const acquireMessage = (id, resource, holderId, fields = {}) => ({
+	type: "acquire",
+	id,
+	resource,
+	holderId,
+	...fields,
+});
+export const releaseMessage = (id, resource, holderId) => ({
+	type: "release",
+	id,
+	resource,
+	holderId,
+});
 export const responseMessage = (id, fields = {}) => ({
 	type: "response",
 	id,
 	...fields,
 });
 export const errorMessage = (error) => ({ type: "error", error });
+
+/** Agent -> broker -> controllers: a live `ask` is blocked, waiting on an answer. */
+export const permissionRequestMessage = (requestId, fields = {}) =>
+	eventMessage(PERMISSION_REQUEST_EVENT, { requestId, ...fields });
+/** Controller -> broker: answer the named session's pending `ask`. */
+export const permissionRespondMessage = (
+	id,
+	target,
+	requestId,
+	decision,
+	reason,
+) =>
+	sendMessage(id, target, PERMISSION_RESPOND_ACTION, {
+		requestId,
+		decision,
+		...(reason === undefined ? {} : { reason }),
+	});
 
 export const isValidMessage = (message) => {
 	try {
@@ -110,6 +169,10 @@ export const isSendMessage = (message) =>
 	isValidMessage(message) && message.type === "send";
 export const isCommandMessage = (message) =>
 	isValidMessage(message) && message.type === "command";
+export const isAcquireMessage = (message) =>
+	isValidMessage(message) && message.type === "acquire";
+export const isReleaseMessage = (message) =>
+	isValidMessage(message) && message.type === "release";
 export const isResponseMessage = (message) =>
 	isValidMessage(message) && message.type === "response";
 export const isErrorMessage = (message) =>
