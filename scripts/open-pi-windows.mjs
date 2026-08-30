@@ -32,6 +32,19 @@ import { fileURLToPath } from "node:url";
 export const DEFAULT_PI_COMMAND =
   "npm exec -- pi --extension ./extensions/pi-broker-bridge.ts";
 
+// The tmux consolidation layer (additive to the per-window opener above):
+// instead of one OS window per session, every session becomes a named window
+// inside one shared tmux session, so `tmux attach -t pi-broker` plus ordinary
+// window navigation (Ctrl-b w) is "one place to see them all" for free — no
+// custom UI needed. scripts/tmux-cleanup.mjs is the other half: it removes
+// windows for sessions the broker no longer has registered.
+export const DEFAULT_TMUX_SESSION = "pi-broker";
+// The window tmux creates when the session itself is created (a tmux session
+// always starts with one window). It never corresponds to a Pi session id, so
+// cleanup must never touch it even though it lives inside the same tmux
+// session as every real one.
+export const TMUX_BOOTSTRAP_WINDOW = "pi-broker-home";
+
 /**
  * What a session id is allowed to be, everywhere.
  *
@@ -164,12 +177,46 @@ export function makeWhich(platform = process.platform, env = process.env) {
 }
 
 /**
+ * Is tmux on PATH? Same shape as every other terminal detector here:
+ * `kind: null` plus a `reason` when it is not, `kind: "tmux"` plus the
+ * command and the (possibly operator-overridden) session name when it is.
+ *
+ * PI_BROKER_TMUX_SESSION lets an operator run more than one consolidated
+ * session on one machine (e.g. separate ones per repo/checkout) without the
+ * default name colliding.
+ */
+export function detectTmux({
+  env = process.env,
+  which = makeWhich(process.platform, env),
+} = {}) {
+  const command = which("tmux");
+  if (!command) {
+    return { kind: null, reason: "tmux is not installed (or not on PATH)" };
+  }
+  return {
+    kind: "tmux",
+    command,
+    sessionName: env.PI_BROKER_TMUX_SESSION || DEFAULT_TMUX_SESSION,
+  };
+}
+
+/**
  * Decide how — or whether — this machine can put a terminal window on screen.
  *
  * Always returns an object. `kind: null` means "cannot open a window here",
  * and `reason` says why in the caller's words. There is deliberately no
  * "well, run it hidden then" branch: not being able to show the session is a
  * hard failure for this project, not a degraded mode.
+ *
+ * PI_BROKER_TERMINAL controls whether the tmux consolidation layer is
+ * preferred over a brand-new OS window:
+ *   auto (default) — prefer tmux if it is installed, else fall back to the
+ *                     per-OS window path below (same as before this option
+ *                     existed).
+ *   tmux           — require tmux; a missing binary is a hard failure rather
+ *                     than a silent fallback, so the operator's explicit
+ *                     request is never quietly ignored.
+ *   window         — skip tmux even if installed, always open a new OS window.
  */
 export function detectTerminal({
   platform = process.platform,
@@ -178,6 +225,20 @@ export function detectTerminal({
 } = {}) {
   if (env.PI_SESSION_OPEN) {
     return { kind: "custom", command: env.PI_SESSION_OPEN };
+  }
+
+  const terminalPreference = env.PI_BROKER_TERMINAL || "auto";
+  if (terminalPreference !== "window") {
+    const tmux = detectTmux({ env, which });
+    if (tmux.kind === "tmux") return tmux;
+    if (terminalPreference === "tmux") {
+      return {
+        kind: null,
+        reason: `PI_BROKER_TERMINAL=tmux was requested but ${tmux.reason}`,
+      };
+    }
+    // preference is "auto" and tmux is unavailable: fall through to the
+    // ordinary per-OS window path below, unchanged.
   }
 
   if (platform === "darwin") {
@@ -296,8 +357,10 @@ export function noTerminalMessage({
   session,
   piCommand = DEFAULT_PI_COMMAND,
 }) {
-  const install =
-    platform === "win32"
+  const install = /tmux/.test(reason ?? "")
+    ? "Install tmux (e.g. `brew install tmux`, `apt install tmux`), or unset " +
+      "PI_BROKER_TERMINAL (or set it to `window`) to open a plain OS window instead."
+    : platform === "win32"
       ? "Install Windows Terminal, or run the session from a console you opened yourself."
       : platform === "darwin"
         ? "Terminal.app plus osascript is required."
@@ -524,6 +587,46 @@ function spawnDetached(command, args) {
   });
 }
 
+/**
+ * Run a command and resolve to whether it exited 0 — never reject on a
+ * non-zero exit, since that is the ordinary "no" answer for `tmux
+ * has-session` (exit 1 just means the session does not exist yet). Only a
+ * failure to launch `tmux` at all (e.g. it vanished from PATH between
+ * detection and use) rejects.
+ */
+function runCheck(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: "ignore" });
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code === 0));
+  });
+}
+
+/**
+ * Make sure the shared pi-broker tmux session exists, creating it with its
+ * bootstrap window if not. Idempotent and safe to call before every session
+ * open: `tmux has-session` is checked first rather than blindly recreating,
+ * so a session with windows already in it (from a previous run, or a human
+ * who attached and opened panes by hand) is never disturbed.
+ */
+export async function ensureTmuxSession({
+  tmuxCommand = "tmux",
+  sessionName = DEFAULT_TMUX_SESSION,
+  bootstrapWindow = TMUX_BOOTSTRAP_WINDOW,
+} = {}) {
+  const exists = await runCheck(tmuxCommand, ["has-session", "-t", sessionName]);
+  if (exists) return { sessionName, created: false };
+  await runToCompletion(tmuxCommand, [
+    "new-session",
+    "-d",
+    "-s",
+    sessionName,
+    "-n",
+    bootstrapWindow,
+  ]);
+  return { sessionName, created: true };
+}
+
 function runToCompletion(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"] });
@@ -599,6 +702,26 @@ export async function openPiWindows({
   // macOS: one AppleScript for every window (see buildAppleScript).
   if (terminal.kind === "osascript") {
     await runToCompletion(terminal.command, ["-e", buildAppleScript(entries)]);
+    return entries;
+  }
+
+  // tmux consolidation layer: every session becomes a named window inside one
+  // shared tmux session instead of a new OS window. Same launcher scripts as
+  // every other platform (writeLauncher, above) — only how they get run
+  // differs.
+  if (terminal.kind === "tmux") {
+    const sessionName = terminal.sessionName || DEFAULT_TMUX_SESSION;
+    await ensureTmuxSession({ tmuxCommand: terminal.command, sessionName });
+    for (const entry of entries) {
+      await runToCompletion(terminal.command, [
+        "new-window",
+        "-t",
+        `${sessionName}:`,
+        "-n",
+        entry.session,
+        `bash ${shellQuote(entry.launcher)}`,
+      ]);
+    }
     return entries;
   }
 

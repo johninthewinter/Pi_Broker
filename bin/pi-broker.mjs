@@ -12,11 +12,12 @@ const modules = {
   prompt: "src/client.mjs",
   interrupt: "src/client.mjs",
   mcp: "src/mcp-server.mjs",
+  "tmux-cleanup": "scripts/tmux-cleanup.mjs",
 };
 
 function usage() {
   process.stderr.write(
-    "usage: pi-broker.mjs serve <socket> | list <socket> | prompt <socket> <session> <text> | interrupt <socket> <session> | mcp [socket]\n",
+    "usage: pi-broker.mjs serve <socket> | list <socket> | prompt <socket> <session> <text> | interrupt <socket> <session> | mcp [socket] | tmux-cleanup [socket]\n",
   );
   process.exitCode = 2;
 }
@@ -26,8 +27,9 @@ else {
   const rest = args.slice(1);
   const valid =
     // `mcp` alone is legal: the adapter then uses the deterministic default
-    // socket and starts the broker there itself.
-    command === "mcp"
+    // socket and starts the broker there itself. `tmux-cleanup` follows the
+    // same shape — it can name a socket, or fall back to the same default.
+    command === "mcp" || command === "tmux-cleanup"
       ? rest.length <= 1
       : command === "serve" || command === "list"
         ? rest.length === 1
@@ -37,7 +39,7 @@ else {
   if (!valid) usage();
   else {
     const moduleArgs =
-      command === "serve" || command === "mcp"
+      command === "serve" || command === "mcp" || command === "tmux-cleanup"
         ? rest
         : [rest[0], command, ...rest.slice(1)];
     const child = spawn(
