@@ -236,9 +236,14 @@ so a host that speaks MCP and a human at a shell get identical capability.
 - **One MCP adapter, not three host-specific plugins.** All three host
   configuration surfaces were exercised against the same adapter. Separate
   adapters would add maintenance cost nothing has justified.
-- **Manual terminal launch, not tmux or a pane manager.** Remote terminal
-  attachment has no proof behind it. Ordinary terminal tabs preserve the
-  interaction model that does.
+- **One shared tmux session when tmux is available.** Each delegated session
+  becomes one window in `pi-broker`, so `tmux attach -t pi-broker` plus
+  ordinary window navigation (`Ctrl-b w`) is one place to see them all. A
+  session started with nobody attached (e.g. from a background dispatch) also
+  sends a desktop notification pointing at that attach command, so the work is
+  discoverable even with no terminal open; if a client is already attached,
+  the notification is suppressed rather than repeated. `PI_BROKER_NOTIFY=0`
+  disables it entirely.
 
 ---
 
@@ -250,11 +255,20 @@ npm run quickstart
 ```
 
 That one command picks a temporary socket, starts the broker in the background,
-and opens **two real terminal windows** — one per Pi session — each already
-running a normal interactive `pi` TUI with the bridge extension loaded and
-`PI_BROKER_SOCKET` / `PI_BROKER_SESSION_ID` already set. The windows are titled
-`pi-broker session-a` and `pi-broker session-b`, so moving between sessions is
-ordinary window switching (Cmd-\` in Terminal, or Mission Control).
+and opens **two real interactive Pi sessions**. With tmux installed (the
+default on this machine), they are windows named `session-a` and `session-b`
+inside the shared `pi-broker` session — attach once with:
+
+```bash
+tmux attach -t pi-broker
+```
+
+and switch between them with ordinary tmux window navigation (`Ctrl-b w`). If
+nobody was attached when the windows were created, a desktop notification
+fires with that same attach command. Without tmux, the previous per-session
+OS terminal-window path is used instead, each window already running a normal
+interactive `pi` TUI with the bridge extension loaded and `PI_BROKER_SOCKET` /
+`PI_BROKER_SESSION_ID` already set.
 
 Which window it opens depends on the machine — see
 [Which terminal gets opened](#which-terminal-gets-opened). On a machine where
@@ -314,7 +328,8 @@ launcher script per session and hands it to whatever this machine actually has:
 
 | Platform | What it uses | Evidence |
 | --- | --- | --- |
-| macOS | `osascript` driving Terminal.app, one window per session | proven end to end (`npm run quickstart`, [docs/proofs/2026-08-11-mcp-autoprovision.md](docs/proofs/2026-08-11-mcp-autoprovision.md)) |
+| Any platform with tmux | one shared `pi-broker` tmux session, one window per session; desktop notification (macOS `osascript`, Linux/BSD `notify-send`) when created with nobody attached | tmux path covered by the deterministic test suite; notification delivery live-verified against macOS's own Notification Center database |
+| macOS without tmux | `osascript` driving Terminal.app, one window per session | proven end to end (`npm run quickstart`, [docs/proofs/2026-08-11-mcp-autoprovision.md](docs/proofs/2026-08-11-mcp-autoprovision.md)) |
 | Linux / BSD | the first installed emulator of `x-terminal-emulator`, `gnome-terminal`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `wezterm`, `foot`, `xterm` — requires `DISPLAY` or `WAYLAND_DISPLAY` | proven end to end in a Linux container: real X display, real `xterm` windows, sessions registered, prompt round-tripped |
 | WSL | the Linux path when WSLg or an X server gives it a display; otherwise a Windows-side window via `wt.exe`/`cmd.exe` running `wsl.exe -d <distro> -- bash <launcher>` | detection and command construction verified in a container with a stubbed `wt.exe`; **not run on real WSL** |
 | Windows (native) | `wt.exe new-tab --title …`, falling back to `cmd.exe /c start "<title>" …`, then PowerShell `Start-Process` | **implemented, unverified on real Windows hardware** — unit-tested argv only |

@@ -19,6 +19,9 @@
 // logic anywhere else in the repo):
 //   PI_SESSION_PI_COMMAND  command run inside each session window
 //   PI_SESSION_OPEN        opener called as: <opener> <script-path> <title>
+//   PI_BROKER_NOTIFY       set to 0/false to suppress the desktop notification
+//                          fired when a session is added to a tmux session
+//                          nobody is attached to (see announceTmuxSessions)
 //
 // No headless Pi (-p / --print / --mode) is used or permitted here. If a
 // visible window cannot be opened, this exits non-zero with the exact manual
@@ -647,6 +650,156 @@ function runToCompletion(command, args) {
 }
 
 /**
+ * Run a command and resolve to its stdout, or to null if it could not be run
+ * or exited non-zero. Never rejects: every caller here is best-effort.
+ */
+function runCapture(command, args) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.once("error", () => resolve(null));
+    child.once("close", (code) => resolve(code === 0 ? stdout : null));
+  });
+}
+
+/**
+ * How this machine can put a message in front of a human who is NOT looking at
+ * a terminal. Same shape as every other detector here: `kind: null` plus a
+ * `reason` when there is no way to do it.
+ *
+ * osascript's `display notification` and `notify-send` are chosen because both
+ * ship with the desktop (macOS always; libnotify on essentially every Linux
+ * desktop) — this must not add a dependency to a project that has been careful
+ * to require nothing but Node. Nothing is offered on Windows: there is no
+ * equivalent one-liner in a stock console, and a missing notifier is not an
+ * error, it just means the announcement is skipped.
+ */
+export function detectNotifier({
+  platform = process.platform,
+  env = process.env,
+  which = makeWhich(platform, env),
+} = {}) {
+  const setting = env.PI_BROKER_NOTIFY;
+  if (setting === "0" || setting === "false") {
+    return { kind: null, reason: "PI_BROKER_NOTIFY is off" };
+  }
+  const candidate = platform === "darwin" ? "osascript" : "notify-send";
+  const command = which(candidate);
+  if (!command) {
+    return { kind: null, reason: `${candidate} is not installed (or not on PATH)` };
+  }
+  return { kind: candidate, command };
+}
+
+/**
+ * The exact argv that shows one notification — pure, so the string that a
+ * notifier will interpret is covered by a test rather than by hope.
+ *
+ * The macOS form matters: `osascript -e 'display notification "..."'` would
+ * splice the title and body into a *script*, which is the same injection
+ * surface assertSessionId exists to close. `on run {t, m}` takes them as
+ * arguments instead, so no value here is ever parsed as AppleScript, and the
+ * tmux session name (operator-supplied via PI_BROKER_TMUX_SESSION) needs no
+ * escaping rule of its own.
+ */
+export function notifyArgs({ notifier, title, body }) {
+  if (notifier.kind === "osascript") {
+    return {
+      command: notifier.command,
+      args: [
+        "-e",
+        "on run {t, m}",
+        "-e",
+        "display notification m with title t",
+        "-e",
+        "end run",
+        title,
+        body,
+      ],
+    };
+  }
+  if (notifier.kind === "notify-send") {
+    return { command: notifier.command, args: [title, body] };
+  }
+  throw new Error(`unsupported notifier kind: ${notifier.kind}`);
+}
+
+/**
+ * Is a human currently attached to the consolidated tmux session?
+ *
+ * tmux is the authority on this, so no guessing is required: `list-clients`
+ * prints one line per attached client and nothing when there are none. This is
+ * the signal the announcement below turns on, and it is the reason there is no
+ * "was I called from a background job?" heuristic anywhere in this file — that
+ * question cannot be answered honestly (the opener is always spawned with
+ * pipes, by the MCP adapter as much as by a human's quickstart, so isTTY and
+ * friends say "not a terminal" in both cases). "Is anyone looking at the tmux
+ * session right now" is the question that actually matters, and tmux answers it.
+ */
+export async function tmuxAttachedClientCount({
+  tmuxCommand = "tmux",
+  sessionName = DEFAULT_TMUX_SESSION,
+} = {}) {
+  const out = await runCapture(tmuxCommand, [
+    "list-clients",
+    "-t",
+    sessionName,
+    "-F",
+    "#{client_tty}",
+  ]);
+  if (out === null) return 0;
+  return out.split("\n").filter((line) => line.trim()).length;
+}
+
+/**
+ * Tell the human that delegated work just appeared in the shared tmux session.
+ *
+ * The gap this closes: tmux consolidation is the right default (one place to
+ * see everything, no window storm), but it is *silent*. When a session is
+ * provisioned by a background dispatch — an MCP tool call from a host nobody is
+ * watching — the session is created, runs, and waits for input with nothing
+ * anywhere on screen saying it exists. The premise of this project is that the
+ * operator can watch and steer; that premise fails if they never find out.
+ *
+ * Deliberately narrow:
+ *  - only the tmux path (a new OS window announces itself by appearing);
+ *  - only when nobody is attached (if a client is attached, the new window is
+ *    already visible in their status bar — a notification would be noise);
+ *  - best-effort, never fatal: failing to announce a session must not fail
+ *    opening it.
+ */
+export async function announceTmuxSessions({
+  sessions,
+  sessionName = DEFAULT_TMUX_SESSION,
+  tmuxCommand = "tmux",
+  platform = process.platform,
+  env = process.env,
+  notifier = detectNotifier({ platform, env }),
+  run = runCapture,
+}) {
+  if (notifier.kind === null) return { notified: false, reason: notifier.reason };
+  const attached = await tmuxAttachedClientCount({ tmuxCommand, sessionName });
+  if (attached > 0)
+    return { notified: false, reason: "a client is already attached" };
+
+  const title =
+    sessions.length === 1
+      ? `Pi Broker: ${sessions[0]} started`
+      : `Pi Broker: ${sessions.length} sessions started`;
+  // One line, and every word of it is the thing to do next: attach to the one
+  // shared session, then Ctrl-b w to see every delegated session at once.
+  const body =
+    `${sessions.join(", ")} — run: tmux attach -t ${sessionName} ` +
+    "(then Ctrl-b w for all sessions)";
+  const { command, args } = notifyArgs({ notifier, title, body });
+  await run(command, args);
+  return { notified: true, title, body };
+}
+
+/**
  * Open one visible, interactive Pi window per session.
  * Throws — never falls back to anything headless — if it cannot.
  */
@@ -721,6 +874,21 @@ export async function openPiWindows({
         entry.session,
         `bash ${shellQuote(entry.launcher)}`,
       ]);
+    }
+    // The windows exist and are joinable at this point. Announcing them is a
+    // courtesy on top of that, so it is best-effort: a machine with no
+    // notifier, or a notifier that fails, must not turn a successful open into
+    // a failure.
+    try {
+      await announceTmuxSessions({
+        sessions: entries.map((entry) => entry.session),
+        sessionName,
+        tmuxCommand: terminal.command,
+        platform,
+        env,
+      });
+    } catch {
+      // nothing to do: the session is open and visible in tmux either way.
     }
     return entries;
   }

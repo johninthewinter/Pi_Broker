@@ -18,11 +18,15 @@ import {
   DEFAULT_PI_COMMAND,
   DEFAULT_TMUX_SESSION,
   TMUX_BOOTSTRAP_WINDOW,
+  announceTmuxSessions,
   assertSessionId,
   buildAppleScript,
+  detectNotifier,
   detectTerminal,
   detectTmux,
   ensureTmuxSession,
+  notifyArgs,
+  tmuxAttachedClientCount,
   isWsl,
   noTerminalMessage,
   openPiWindows,
@@ -369,6 +373,156 @@ test("openPiWindows on the tmux path creates the session once and a window per s
   // Real launcher scripts were written, same as every other terminal kind.
   assert.ok(fs.existsSync(path.join(dir, "session-a.sh")));
   assert.ok(fs.existsSync(path.join(dir, "session-b.sh")));
+});
+
+// --- "you have new work" announcement -----------------------------------
+//
+// tmux consolidation is silent by design: a session provisioned by a
+// background dispatch lands in a tmux session nobody is attached to, and
+// nothing anywhere says it exists. These cover the one signal that closes
+// that gap, including that it stays quiet when a human IS attached.
+
+test("detectNotifier reports the desktop notifier the same shape as every other detector", () => {
+  assert.deepEqual(
+    detectNotifier({ platform: "darwin", env: {}, which: whichOnly("osascript") }),
+    { kind: "osascript", command: "/usr/bin/osascript" },
+  );
+  assert.deepEqual(
+    detectNotifier({ platform: "linux", env: {}, which: whichOnly("notify-send") }),
+    { kind: "notify-send", command: "/usr/bin/notify-send" },
+  );
+  const missing = detectNotifier({
+    platform: "linux",
+    env: {},
+    which: () => null,
+  });
+  assert.equal(missing.kind, null);
+  assert.match(missing.reason, /notify-send is not installed/);
+});
+
+test("PI_BROKER_NOTIFY=0 turns the announcement off without looking at PATH", () => {
+  const notifier = detectNotifier({
+    platform: "darwin",
+    env: { PI_BROKER_NOTIFY: "0" },
+    which: () => assert.fail("PATH must not be searched when notifications are off"),
+  });
+  assert.equal(notifier.kind, null);
+  assert.match(notifier.reason, /PI_BROKER_NOTIFY/);
+});
+
+test("notification text is passed as arguments, never spliced into AppleScript", () => {
+  const { command, args } = notifyArgs({
+    notifier: { kind: "osascript", command: "/usr/bin/osascript" },
+    title: "Pi Broker: session-a started",
+    // A tmux session name is operator-supplied (PI_BROKER_TMUX_SESSION), so a
+    // quote in the body must be inert rather than escaped.
+    body: 'session-a — run: tmux attach -t my"session',
+  });
+  assert.equal(command, "/usr/bin/osascript");
+  assert.deepEqual(args.slice(0, 6), [
+    "-e",
+    "on run {t, m}",
+    "-e",
+    "display notification m with title t",
+    "-e",
+    "end run",
+  ]);
+  // The values are argv entries after the script, not part of any -e fragment.
+  assert.deepEqual(args.slice(6), [
+    "Pi Broker: session-a started",
+    'session-a — run: tmux attach -t my"session',
+  ]);
+  for (const fragment of args.filter((_, i) => i % 2 === 0 && i < 6)) {
+    assert.equal(fragment, "-e");
+  }
+  assert.deepEqual(
+    notifyArgs({
+      notifier: { kind: "notify-send", command: "/usr/bin/notify-send" },
+      title: "t",
+      body: "b",
+    }),
+    { command: "/usr/bin/notify-send", args: ["t", "b"] },
+  );
+});
+
+test("the announcement names the sessions and the one command that shows them", async (t) => {
+  const dir = tmpdir(t);
+  const calls = [];
+  const result = await announceTmuxSessions({
+    sessions: ["session-a"],
+    sessionName: "pi-broker",
+    tmuxCommand: fakeTmux(dir), // list-clients prints nothing: nobody attached
+    notifier: { kind: "notify-send", command: "/usr/bin/notify-send" },
+    run: async (command, args) => calls.push({ command, args }),
+  });
+  assert.equal(result.notified, true);
+  assert.match(result.title, /session-a/);
+  assert.match(result.body, /tmux attach -t pi-broker/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "/usr/bin/notify-send");
+});
+
+test("nobody is notified when a client is already attached to the tmux session", async (t) => {
+  const dir = tmpdir(t);
+  const tmuxCommand = path.join(dir, "tmux-attached");
+  fs.writeFileSync(
+    tmuxCommand,
+    ["#!/usr/bin/env bash", 'echo "/dev/ttys004"', ""].join("\n"),
+    { mode: 0o755 },
+  );
+  assert.equal(
+    await tmuxAttachedClientCount({ tmuxCommand, sessionName: "pi-broker" }),
+    1,
+  );
+  const result = await announceTmuxSessions({
+    sessions: ["session-a"],
+    tmuxCommand,
+    notifier: { kind: "notify-send", command: "/usr/bin/notify-send" },
+    run: () => assert.fail("must not notify a human who is already watching"),
+  });
+  assert.equal(result.notified, false);
+  assert.match(result.reason, /attached/);
+});
+
+test("a machine with no notifier still opens the session, silently", async (t) => {
+  const dir = tmpdir(t);
+  const result = await announceTmuxSessions({
+    sessions: ["session-a"],
+    tmuxCommand: fakeTmux(dir),
+    notifier: { kind: null, reason: "notify-send is not installed" },
+    run: () => assert.fail("nothing to run without a notifier"),
+  });
+  assert.equal(result.notified, false);
+});
+
+test("openPiWindows on the tmux path announces the new session end to end", async (t) => {
+  const dir = tmpdir(t);
+  const tmuxCommand = fakeTmux(dir);
+  const notifier = path.join(dir, "notify-send");
+  fs.writeFileSync(
+    notifier,
+    [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' "$@" >>"${dir}/notify.log"`,
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  await openPiWindows({
+    root: "/repo",
+    runDir: dir,
+    socket: "/tmp/b.sock",
+    sessions: ["session-a"],
+    platform: "linux",
+    env: { PATH: dir },
+    terminal: { kind: "tmux", command: tmuxCommand, sessionName: "pi-broker" },
+  });
+  const notified = fs.readFileSync(path.join(dir, "notify.log"), "utf8");
+  assert.match(notified, /session-a/);
+  assert.match(notified, /tmux attach -t pi-broker/);
+  // The window itself was still created, in the same shared tmux session.
+  const log = fs.readFileSync(path.join(dir, "tmux.log"), "utf8");
+  assert.match(log, /^new-window -t pi-broker: -n session-a bash /m);
 });
 
 // --- command construction ----------------------------------------------
