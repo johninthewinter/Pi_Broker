@@ -12,13 +12,29 @@ import {
 } from "./protocol.mjs";
 import { readSlotConfig } from "./slots.mjs";
 import { LangfuseTracer } from "./langfuse-tracing.mjs";
+import { cleanupTmuxWindows } from "../scripts/tmux-cleanup.mjs";
 
 function writeJson(socket, value) {
   socket.write(`${JSON.stringify(value)}\n`);
 }
 
+// A tmux window for a session that just disconnected is worth leaving on
+// screen for a while — the human may still be reading the final output —
+// rather than vanishing the instant the process exits. Default: 5 minutes.
+// One env var controls it (mirrors PI_BROKER_COMPACT_AT_PERCENT's shape
+// elsewhere in this repo): 0 or negative disables auto-cleanup entirely,
+// falling back to the pre-existing manual-only `pi-broker tmux-cleanup`.
+const DEFAULT_TMUX_CLEANUP_DELAY_MS = 5 * 60 * 1000;
+
+function resolveTmuxCleanupDelayMs(env = process.env) {
+  const raw = env.PI_BROKER_TMUX_CLEANUP_DELAY_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_TMUX_CLEANUP_DELAY_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : DEFAULT_TMUX_CLEANUP_DELAY_MS;
+}
+
 export class Broker {
-  constructor(socketPath, { tracer, slotConfig } = {}) {
+  constructor(socketPath, { tracer, slotConfig, tmuxCleanupDelayMs, env = process.env } = {}) {
     this.socketPath = socketPath;
     this.server = null;
     this.agents = new Map();
@@ -33,6 +49,49 @@ export class Broker {
     // queue entries: { holderId, socket, id, timer, settled }
     this.slotConfig = slotConfig ?? readSlotConfig();
     this.slots = new Map();
+
+    // See #scheduleTmuxCleanup: one pending timer, debounced across however
+    // many agents disconnect within the grace window, so a burst of exits
+    // triggers one sweep instead of one per session.
+    this.tmuxCleanupDelayMs = tmuxCleanupDelayMs ?? resolveTmuxCleanupDelayMs(env);
+    this.tmuxCleanupTimer = null;
+  }
+
+  /**
+   * Debounced, delayed sweep of stale tmux windows after an agent
+   * disconnects. Reuses the same cleanupTmuxWindows() the manual
+   * `pi-broker tmux-cleanup` CLI command calls — it re-queries this broker's
+   * own live-session list over the socket, so it only ever removes windows
+   * for sessions that are *actually* gone by the time the timer fires, not
+   * necessarily the one that just disconnected (a reconnect in the meantime
+   * is naturally excluded).
+   *
+   * Standard debounce, not a one-shot from the first disconnect: each call
+   * resets the timer, so the sweep always fires `tmuxCleanupDelayMs` after
+   * the *last* disconnect in a burst, not a fixed window from the first one.
+   * A one-shot-from-first-call anchor can under-shoot a burst spread wider
+   * than the delay (e.g. several sessions ending seconds apart at the end of
+   * a batch) — resetting guarantees every disconnect that arrives before the
+   * timer fires is captured by that same sweep.
+   *
+   * Errors are logged, never thrown — a cleanup failure (e.g. tmux not
+   * installed, session already gone) must not crash the broker process.
+   */
+  #scheduleTmuxCleanup() {
+    if (this.tmuxCleanupDelayMs <= 0) return; // auto-cleanup disabled
+    if (this.tmuxCleanupTimer) clearTimeout(this.tmuxCleanupTimer);
+    this.tmuxCleanupTimer = setTimeout(async () => {
+      this.tmuxCleanupTimer = null;
+      try {
+        await cleanupTmuxWindows({ socketPath: this.socketPath });
+      } catch (error) {
+        process.stderr.write(
+          `pi-broker: auto tmux cleanup failed: ${error.message}\n`,
+        );
+      }
+    }, this.tmuxCleanupDelayMs);
+    // Never let a pending cleanup sweep keep the process alive on its own.
+    this.tmuxCleanupTimer.unref?.();
   }
 
   #slotState(resource) {
@@ -63,6 +122,10 @@ export class Broker {
   }
 
   async close() {
+    if (this.tmuxCleanupTimer) {
+      clearTimeout(this.tmuxCleanupTimer);
+      this.tmuxCleanupTimer = null;
+    }
     for (const socket of this.agents.values()) socket.destroy();
     for (const socket of this.controllers) socket.destroy();
     if (this.server) {
@@ -103,6 +166,7 @@ export class Broker {
             sessionId: socket._piBrokerSessionId
           })
         );
+        this.#scheduleTmuxCleanup();
       }
       if (socket._piBrokerRole === "controller")
         this.controllers.delete(socket);

@@ -7,6 +7,7 @@ import test from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Broker } from "../src/broker.mjs";
+import { DEFAULT_TMUX_SESSION, TMUX_BOOTSTRAP_WINDOW } from "../scripts/open-pi-windows.mjs";
 import {
   commandMessage,
   errorMessage,
@@ -493,6 +494,148 @@ test("release frees a holder's slot and reports released:true", async () => {
   controller.socket.destroy();
   await broker.close();
   fs.rmdirSync(runtime);
+});
+
+// --- auto tmux cleanup on agent disconnect --------------------------------
+//
+// Same fake-tmux seam as test/tmux-cleanup.test.mjs — a shell script standing
+// in for the real `tmux` binary, logging kill-window calls to a file this
+// test can read back.
+
+function fakeTmuxForBroker(dir, windowNames) {
+  fs.writeFileSync(path.join(dir, "windows.json"), JSON.stringify(windowNames));
+  const tmuxPath = path.join(dir, "tmux");
+  fs.writeFileSync(
+    tmuxPath,
+    [
+      "#!/usr/bin/env bash",
+      `LOGDIR="${dir}"`,
+      'if [ "$1" = "list-windows" ]; then',
+      '  node -e "console.log(JSON.parse(require(\'fs\').readFileSync(process.argv[1],\'utf8\')).join(String.fromCharCode(10)))" "$LOGDIR/windows.json"',
+      "  exit 0",
+      'elif [ "$1" = "kill-window" ]; then',
+      '  echo "$@" >>"$LOGDIR/kills.log"',
+      "  exit 0",
+      "fi",
+      "exit 1",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return tmuxPath;
+}
+
+function withFakeTmuxCommand(t, tmuxCommand) {
+  const previous = process.env.PI_BROKER_TMUX_COMMAND;
+  process.env.PI_BROKER_TMUX_COMMAND = tmuxCommand;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_BROKER_TMUX_COMMAND;
+    else process.env.PI_BROKER_TMUX_COMMAND = previous;
+  });
+}
+
+test("broker sweeps stale tmux windows once the grace period elapses after an agent disconnects", async (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-autoclean-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const tmuxCommand = fakeTmuxForBroker(runtime, [
+    TMUX_BOOTSTRAP_WINDOW,
+    "alpha",
+  ]);
+  withFakeTmuxCommand(t, tmuxCommand);
+
+  const broker = new Broker(socketPath, { tmuxCleanupDelayMs: 30 });
+  await broker.start();
+
+  const alpha = peer(socketPath);
+  alpha.socket.write('{"type":"register","role":"agent","sessionId":"alpha"}\n');
+  await waitFor(() => alpha.messages.find((item) => item.type === "registered"));
+
+  alpha.socket.destroy();
+  await waitFor(() => fs.existsSync(path.join(runtime, "kills.log")), 2000);
+  const kills = fs.readFileSync(path.join(runtime, "kills.log"), "utf8").trim();
+  assert.equal(kills, `kill-window -t ${DEFAULT_TMUX_SESSION}:alpha`);
+
+  await broker.close();
+  fs.rmSync(runtime, { recursive: true, force: true });
+});
+
+test("broker never auto-sweeps when tmuxCleanupDelayMs is 0", async (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-autoclean-off-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const tmuxCommand = fakeTmuxForBroker(runtime, [
+    TMUX_BOOTSTRAP_WINDOW,
+    "alpha",
+  ]);
+  withFakeTmuxCommand(t, tmuxCommand);
+
+  const broker = new Broker(socketPath, { tmuxCleanupDelayMs: 0 });
+  await broker.start();
+
+  const alpha = peer(socketPath);
+  alpha.socket.write('{"type":"register","role":"agent","sessionId":"alpha"}\n');
+  await waitFor(() => alpha.messages.find((item) => item.type === "registered"));
+
+  alpha.socket.destroy();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.ok(!fs.existsSync(path.join(runtime, "kills.log")));
+
+  await broker.close();
+  fs.rmSync(runtime, { recursive: true, force: true });
+});
+
+test("broker eventually sweeps every disconnected session's window exactly once", async (t) => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "pi-broker-autoclean-burst-"));
+  const socketPath = path.join(runtime, "broker.sock");
+  const tmuxCommand = fakeTmuxForBroker(runtime, [
+    TMUX_BOOTSTRAP_WINDOW,
+    "alpha",
+    "beta",
+  ]);
+  withFakeTmuxCommand(t, tmuxCommand);
+
+  const broker = new Broker(socketPath, { tmuxCleanupDelayMs: 50 });
+  await broker.start();
+
+  const alpha = peer(socketPath);
+  const beta = peer(socketPath);
+  alpha.socket.write('{"type":"register","role":"agent","sessionId":"alpha"}\n');
+  beta.socket.write('{"type":"register","role":"agent","sessionId":"beta"}\n');
+  await waitFor(() => alpha.messages.find((item) => item.type === "registered"));
+  await waitFor(() => beta.messages.find((item) => item.type === "registered"));
+
+  // Whether these two disconnects land inside the same debounce window or
+  // trigger two back-to-back sweeps depends on real-world timing (this test
+  // makes no assumption either way — see #scheduleTmuxCleanup's own doc
+  // comment for why it resets rather than a one-shot-from-the-first-call
+  // window). What must hold regardless: every stale window is eventually
+  // killed, and never more than once — the latter is structurally guaranteed
+  // by cleanupTmuxWindows() re-querying tmux's actual live window list on
+  // each sweep (an already-gone window is never in that list again to kill),
+  // not something this test needs to race a timer to prove.
+  alpha.socket.destroy();
+  beta.socket.destroy();
+
+  await waitFor(() => {
+    if (!fs.existsSync(path.join(runtime, "kills.log"))) return false;
+    const lines = fs
+      .readFileSync(path.join(runtime, "kills.log"), "utf8")
+      .trim()
+      .split("\n");
+    return lines.includes(`kill-window -t ${DEFAULT_TMUX_SESSION}:alpha`) &&
+      lines.includes(`kill-window -t ${DEFAULT_TMUX_SESSION}:beta`);
+  }, 5000);
+
+  const kills = fs
+    .readFileSync(path.join(runtime, "kills.log"), "utf8")
+    .trim()
+    .split("\n");
+  assert.deepEqual(kills.sort(), [
+    `kill-window -t ${DEFAULT_TMUX_SESSION}:alpha`,
+    `kill-window -t ${DEFAULT_TMUX_SESSION}:beta`,
+  ]);
+
+  await broker.close();
+  fs.rmSync(runtime, { recursive: true, force: true });
 });
 
 test("pi-broker rejects an invalid subcommand with usage and exit code 2", async () => {
