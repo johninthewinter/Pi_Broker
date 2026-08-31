@@ -35,7 +35,12 @@
 #                              actually register with the broker after the
 #                              opener returns, before failing loudly instead
 #                              of printing a false "quickstart is up"
-#                              (default 20000)
+#                              (default 90000 — `pi` startup itself, before it
+#                              ever reaches the broker-registration step, can
+#                              genuinely take 30-60s+ on a machine with a lot
+#                              of globally-installed skills/extensions; a
+#                              tighter default flakes on exactly that machine,
+#                              not because anything is actually broken)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -140,7 +145,7 @@ PI_SESSION_OPEN="${PI_QUICKSTART_OPEN:-}" \
 # never creates a window (GUI session unreachable, `do script` swallowed).
 # So confirm with the broker itself — a session only shows up in `list` once
 # its own Pi process has connected — before trusting anything is "up".
-REGISTER_TIMEOUT_MS="${PI_QUICKSTART_REGISTER_TIMEOUT_MS:-20000}"
+REGISTER_TIMEOUT_MS="${PI_QUICKSTART_REGISTER_TIMEOUT_MS:-90000}"
 if ! node "$ROOT/scripts/wait-for-sessions.mjs" "$SOCKET" "$REGISTER_TIMEOUT_MS" "${SESSIONS[@]}"; then
   echo "quickstart: window(s) were launched but session(s) never registered with the broker." >&2
   echo "quickstart: broker is still running (pid $BROKER_PID, socket $SOCKET) in case a window is just slow." >&2
