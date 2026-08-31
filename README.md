@@ -219,7 +219,7 @@ Four small pieces, no daemon manager, no wrapper around the `pi` binary:
   through `sendUserMessage` (steering if the agent is mid-turn, plain if idle),
   forwards the lifecycle events above, and accepts interrupt and shutdown.
 - **`bin/pi-broker.mjs`** — one dispatcher: `serve`, `list`, `prompt`,
-  `interrupt`, `mcp`.
+  `interrupt`, `compact`, `mcp`, `tmux-cleanup`, `dashboard`.
 - **`src/mcp-server.mjs`** — a stdio MCP adapter exposing exactly three tools —
   `pi_list`, `pi_prompt`, `pi_interrupt` — to any MCP-speaking host.
 
@@ -243,7 +243,12 @@ so a host that speaks MCP and a human at a shell get identical capability.
   sends a desktop notification pointing at that attach command, so the work is
   discoverable even with no terminal open; if a client is already attached,
   the notification is suppressed rather than repeated. `PI_BROKER_NOTIFY=0`
-  disables it entirely.
+  disables it entirely. `npm run tmux:dashboard` goes one step further —
+  every live window visible at once, tiled, in a throwaway session (see
+  [Watching several sessions at once](#watching-several-sessions-at-once)) —
+  and a disconnected session's window is cleaned up automatically a few
+  minutes after it exits, not instantly, without ever touching the session's
+  own transcript (see [Automatic window cleanup](#automatic-window-cleanup)).
 
 ---
 
@@ -318,6 +323,53 @@ run with cwd at Pi Broker's own directory, same as always:
 ```bash
 PI_QUICKSTART_TARGET_DIR=/path/to/other/repo npm run quickstart -- 1
 ```
+
+### Watching several sessions at once
+
+`tmux attach -t pi-broker` plus `Ctrl-b w` gets you to any one window, but
+only one at a time. When you want several visible simultaneously:
+
+```bash
+npm run tmux:dashboard
+tmux attach -t pi-broker-dashboard
+```
+
+This builds a tiled view of every live session's window, side by side, in one
+screen. It never uses `join-pane` — that tmux primitive physically *moves* a
+pane out of its window, and every Pi Broker command (`prompt`, `interrupt`,
+`tmux-cleanup`) addresses a session by that window's name, so a join gone
+even slightly wrong would silently break those commands until put back
+exactly right. Instead this creates a *second*, throwaway tmux session per
+window — tmux's "grouped session" feature, which shares a window's actual
+content without moving or copying it — each pre-selected to show one
+specific window, then attaches one dashboard pane to each. Killing the
+dashboard session (`tmux kill-session -t pi-broker-dashboard`, or just
+rerunning `npm run tmux:dashboard`, which replaces it) only ends those
+viewing clients; the sessions it was showing are completely unaffected,
+before, during, and after.
+
+A plain `tmux attach -t session:window` looks like it should pin what a
+client shows, but does not — tmux's "current window" is a property of the
+*session*, shared by every ordinary client attached to it, so two clients
+each attaching to the same session and selecting different windows just keep
+overriding each other. Grouped sessions exist specifically to give each
+viewport its own independent current-window state instead.
+
+### Automatic window cleanup
+
+A tmux window for a session that just disconnected is worth leaving on
+screen for a while — you may still be reading its final output — rather than
+vanishing the instant the process exits. Five minutes after a session
+disconnects, the broker sweeps it (and anything else no longer live) via the
+same logic `pi-broker tmux-cleanup` runs by hand. Nothing about the
+session's own data is affected: every Pi session's full transcript already
+lives independently on disk (`~/.pi/agent/sessions/...`) regardless of
+whether its tmux window still exists, so closing the window never loses
+history.
+
+`PI_BROKER_TMUX_CLEANUP_DELAY_MS` overrides the delay; `0` (or any
+non-positive value) disables automatic cleanup entirely, leaving only the
+manual `pi-broker tmux-cleanup` command.
 
 ### Which terminal gets opened
 
