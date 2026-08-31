@@ -1,10 +1,10 @@
 import net from "node:net";
-import { permissionRespondMessage } from "./protocol.mjs";
+import { compactMessage, permissionRespondMessage } from "./protocol.mjs";
 
 const [socketPath, command, target, ...rest] = process.argv.slice(2);
 if (!socketPath || !command) {
   process.stderr.write(
-    "usage: node src/client.mjs <socket> list|prompt|interrupt|acquire|release <target> [text]\n" +
+    "usage: node src/client.mjs <socket> list|prompt|interrupt|compact|acquire|release <target> [text]\n" +
       "       node src/client.mjs <socket> permission-respond <target> <requestId> allow|deny|defer [reason]\n",
   );
   process.exit(2);
@@ -60,6 +60,17 @@ socket.on("data", (chunk) => {
       } else if (command === "interrupt") {
         if (!target) throw new Error("interrupt requires target");
         write({ type: "send", id: requestId, target, action: "interrupt" });
+      } else if (command === "compact") {
+        if (!target) throw new Error("compact requires target");
+        // Trailing words, if any, are the compaction's custom instructions
+        // ("keep the API surface decisions"), same positional shape as prompt.
+        write(
+          compactMessage(
+            requestId,
+            target,
+            rest.length ? rest.join(" ") : undefined,
+          ),
+        );
       } else if (command === "permission-respond") {
         const [permissionRequestId, decision, ...reason] = rest;
         if (!target || !permissionRequestId || !decision)
@@ -129,6 +140,22 @@ socket.on("data", (chunk) => {
         target,
         requestId: rest[0],
         decision: rest[1],
+      });
+      return;
+    }
+    // Unlike interrupt, compact does not finish on the broker's delivery ack:
+    // the ack only says the command reached the session, and a compaction can
+    // still be refused there ("Already compacted", nothing to summarize). The
+    // session's own compaction_finished event is the outcome, so wait for it.
+    if (command === "compact" && message.event === "compaction_finished") {
+      if (message.sessionId !== target) continue;
+      finish({
+        target,
+        compacted: message.ok,
+        trigger: message.trigger,
+        tokensBefore: message.tokensBefore,
+        estimatedTokensAfter: message.estimatedTokensAfter,
+        error: message.error,
       });
       return;
     }
