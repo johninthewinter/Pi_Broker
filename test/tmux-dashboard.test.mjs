@@ -22,6 +22,7 @@ import {
   buildDashboardCommands,
   computeDashboardTargets,
   openTmuxDashboard,
+  parseCliArgs,
   viewSessionName,
 } from "../scripts/tmux-dashboard.mjs";
 
@@ -32,6 +33,41 @@ function tmpdir(t) {
 }
 
 // --- pure logic ------------------------------------------------------------
+
+test("parseCliArgs: no args means default dashboard name, no attach", () => {
+  assert.deepEqual(parseCliArgs([]), {
+    attach: false,
+    dashboardSessionName: DEFAULT_DASHBOARD_SESSION,
+  });
+});
+
+test("parseCliArgs: a bare name with no --attach", () => {
+  assert.deepEqual(parseCliArgs(["my-dashboard"]), {
+    attach: false,
+    dashboardSessionName: "my-dashboard",
+  });
+});
+
+test("parseCliArgs: --attach alone still uses the default name", () => {
+  assert.deepEqual(parseCliArgs(["--attach"]), {
+    attach: true,
+    dashboardSessionName: DEFAULT_DASHBOARD_SESSION,
+  });
+});
+
+test("parseCliArgs: name then --attach", () => {
+  assert.deepEqual(parseCliArgs(["my-dashboard", "--attach"]), {
+    attach: true,
+    dashboardSessionName: "my-dashboard",
+  });
+});
+
+test("parseCliArgs: --attach then name (order does not matter)", () => {
+  assert.deepEqual(parseCliArgs(["--attach", "my-dashboard"]), {
+    attach: true,
+    dashboardSessionName: "my-dashboard",
+  });
+});
 
 test("viewSessionName is deterministic and index-scoped", () => {
   assert.equal(viewSessionName("pi-broker-dashboard", 0), "pi-broker-dashboard-view-0");
@@ -319,3 +355,31 @@ test(
     );
   },
 );
+
+// --- CLI --attach path, against a fake tmux -------------------------------
+//
+// Cannot exercise a real interactive `tmux attach` here — there is no real
+// terminal to hand over to it in a test run. What this proves instead: the
+// --attach code path builds the dashboard, then genuinely execs into the
+// attach step (inherited stdio) and exits cleanly once that process ends —
+// a fake `attach` that exits 0 immediately stands in for a normal human
+// detach (Ctrl-b d), which also exits 0.
+
+test("CLI --attach: builds the dashboard, then execs into attach and exits cleanly once it returns", async (t) => {
+  const dir = tmpdir(t);
+  const tmuxCommand = fakeTmux(dir, [TMUX_BOOTSTRAP_WINDOW, "session-a"]);
+
+  const { execFileSync } = await import("node:child_process");
+  const output = execFileSync(
+    process.execPath,
+    [path.resolve("scripts/tmux-dashboard.mjs"), "--attach"],
+    {
+      env: { ...process.env, PI_BROKER_TMUX_COMMAND: tmuxCommand },
+      timeout: 10000,
+    },
+  ).toString();
+
+  assert.match(output, /dashboard ready with 1 pane\(s\) — attaching/);
+  const commands = fs.readFileSync(path.join(dir, "commands.log"), "utf8").trim().split("\n");
+  assert.ok(commands.some((line) => line.startsWith("attach -t")), "must have run tmux attach");
+});
