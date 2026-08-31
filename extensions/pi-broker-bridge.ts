@@ -300,10 +300,16 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
    * would race that check and abort a turn that was finishing anyway.
    */
   function maybeAutoCompact(
+    mode: ExtensionContext["mode"],
     stopReason: string | undefined,
     percent: number | null | undefined,
   ) {
     if (AUTO_COMPACT_PERCENT <= 0 || autoCompactStoodDown) return;
+    // Only the interactive TUI is what this fix is for — a human or the
+    // broker can watch and steer it. Other modes (if this extension is ever
+    // loaded under one) get none of that visibility, so leave them to pi's
+    // own end-of-run check rather than aborting a turn nobody can see.
+    if (mode !== "tui") return;
     if (stopReason !== "toolUse") return;
     if (compactionInFlight) return;
     if (consecutiveAutoCompactFailures >= MAX_AUTO_COMPACT_FAILURES) return;
@@ -627,7 +633,7 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
     // Report first, act second: the threshold check aborts the run, so doing it
     // before the send would cost the controller the very reading that explains
     // why the compaction fired.
-    maybeAutoCompact(event.message.stopReason, contextUsage?.percent);
+    maybeAutoCompact(ctx.mode, event.message.stopReason, contextUsage?.percent);
   });
 
   // Forwarded for observability only — the bridge's own compaction state is
