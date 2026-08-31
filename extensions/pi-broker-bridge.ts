@@ -9,7 +9,12 @@ type PermissionDecision = "allow" | "deny" | "defer";
 type BrokerCommand = {
   type: "command";
   id?: string;
-  action: "prompt" | "interrupt" | "shutdown" | "permission_respond";
+  action:
+    | "prompt"
+    | "interrupt"
+    | "shutdown"
+    | "permission_respond"
+    | "compact";
   text?: string;
   delivery?: "steer" | "followUp";
   requestId?: string;
@@ -68,6 +73,67 @@ const PERMISSION_WAIT_MS =
 // nothing (ADR 0007 invariant 3).
 const AUTHORIZER_NAME = "pi-broker";
 
+// --- Mid-loop compaction ---------------------------------------------------
+//
+// Pi's own auto-compaction check (`_checkCompaction` in core/agent-session.js)
+// only runs at `agent_end` or before a new prompt is submitted. It never runs
+// between the individual tool calls of one uninterrupted agent run, so a model
+// that keeps answering `stopReason: "toolUse"` never reaches the check at all.
+// Upstream: https://github.com/earendil-works/pi/issues/8884. A real dispatched
+// session here climbed 13k -> 170k tokens across 558 consecutive tool-use
+// messages, past its configured reserve, with zero compactions, until the local
+// model server ran out of memory and died.
+//
+// The bridge is in a position to close that gap without leaving the TUI:
+// `message_end` fires once per assistant message *including* every message
+// inside a tool loop, and `ExtensionContext.compact()` is a first-class API on
+// the same ctx the handler already receives. So the fix is a threshold check on
+// the context reading this handler already reads for telemetry.
+//
+// Percent of the context window at which a mid-loop compaction is forced. The
+// incident's server died around 65% of a 262k window, so the default leaves
+// real headroom below that rather than trying to land just under it — one
+// oversized tool result between two checks must not be enough to cross from
+// "safe" to "dead". Set the env var to 0 (or any non-positive value) to turn
+// the automatic trigger off and keep only the manual `compact` action.
+const AUTO_COMPACT_PERCENT = (() => {
+  const raw = process.env.PI_BROKER_COMPACT_AT_PERCENT;
+  if (raw === undefined || raw.trim() === "") return 55;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : 55;
+})();
+
+// `compact()` aborts the running agent before summarizing (see
+// AgentSession.compact), and pi's own threshold path deliberately does not
+// auto-retry either — so a mid-loop compaction ends the run. For a *delegated*
+// session that would silently abandon the controller's task half-done, which is
+// not a mitigation. Once the summary lands the bridge therefore sends one
+// ordinary user message telling the agent to carry on; it goes through the same
+// `sendUserMessage` path as any delegated prompt, so it shows up in the TUI as
+// visible input the human can see, interrupt, or override.
+const COMPACT_RESUME_TEXT =
+  process.env.PI_BROKER_COMPACT_RESUME_TEXT ??
+  "[pi-broker] Your context was compacted mid-task because it was about to " +
+    "overflow the model's context window. The summary above is what survived. " +
+    "Continue the task you were working on from exactly where you left off — " +
+    "do not restart it, and do not re-do work the summary says is already done.";
+
+// After this many consecutive failures the automatic trigger stands down for
+// the rest of the session. A failing compaction is usually a permanent
+// condition for this branch ("Already compacted", "Nothing to compact", no
+// model) rather than a transient one, and retrying it on every subsequent
+// assistant message would be its own runaway loop.
+const MAX_AUTO_COMPACT_FAILURES = 3;
+
+// A compaction can succeed and still leave context above the threshold — a
+// branch whose kept tail (`keepRecentTokens`) is already bigger than the
+// threshold allows, or a threshold set below the session's own floor. Firing
+// again on the next message would then abort the agent every single turn
+// forever: a worse failure than the one being fixed. One ineffective
+// compaction stands the automatic trigger down for the rest of the session and
+// says so; pi's own end-of-turn check and the manual `compact` action both
+// still work.
+
 export default function piBrokerBridge(pi: ExtensionAPI) {
   const socketPath = process.env.PI_BROKER_SOCKET;
   const sessionId = process.env.PI_BROKER_SESSION_ID;
@@ -90,6 +156,19 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
     (verdict: AuthorizerVerdict) => void
   >();
   let disposeAuthorizer: (() => void) | undefined;
+  // Compaction is asynchronous and fire-and-forget: `context.compact()` returns
+  // immediately and reports back through onComplete/onError. Nothing on
+  // ExtensionContext exposes "a compaction is running" (isIdle() answers a
+  // different question — the agent is idle *because* compaction aborted it), so
+  // the bridge holds that state itself. Without it, every assistant message
+  // arriving while the first summary is still being generated would start
+  // another one.
+  let compactionInFlight = false;
+  // Set when the compaction currently in flight interrupted a live tool loop,
+  // i.e. the agent had more work queued and must be told to resume afterwards.
+  let resumeAfterCompaction = false;
+  let consecutiveAutoCompactFailures = 0;
+  let autoCompactStoodDown = false;
 
   function send(value: unknown) {
     if (socket?.writable) socket.write(`${JSON.stringify(value)}\n`);
@@ -120,6 +199,121 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
     else settle({ kind: "defer" });
   }
 
+  /**
+   * Start a compaction and report both ends of it broker-ward.
+   *
+   * `trigger` distinguishes the automatic mid-loop threshold from a controller
+   * asking for one, because they want different follow-through: only the
+   * automatic one interrupted work that was still in progress and therefore
+   * needs the resume nudge.
+   *
+   * Returns false when the request was dropped (no live context, or one is
+   * already running) so the manual path can say so instead of implying it fired.
+   */
+  function startCompaction(
+    trigger: "auto" | "manual",
+    options: { resume: boolean; customInstructions?: string },
+  ): boolean {
+    if (!context || compactionInFlight) return false;
+    compactionInFlight = true;
+    resumeAfterCompaction = options.resume;
+    const usage = context.getContextUsage?.();
+    send({
+      type: "event",
+      event: "compaction_started",
+      trigger,
+      willResume: options.resume,
+      contextUsage: usage
+        ? {
+            tokens: usage.tokens,
+            contextWindow: usage.contextWindow,
+            percent: usage.percent,
+          }
+        : undefined,
+      emittedAt: Date.now(),
+    });
+    context.compact({
+      customInstructions: options.customInstructions,
+      onComplete: (result) => {
+        compactionInFlight = false;
+        if (trigger === "auto") consecutiveAutoCompactFailures = 0;
+        // contextWindow is read from the pre-compaction usage above; the model
+        // has not changed underneath a compaction it just ran.
+        const window = usage?.contextWindow ?? 0;
+        const after = result?.estimatedTokensAfter;
+        if (
+          trigger === "auto" &&
+          window > 0 &&
+          typeof after === "number" &&
+          (after / window) * 100 >= AUTO_COMPACT_PERCENT
+        ) {
+          autoCompactStoodDown = true;
+          context?.ui.notify(
+            `Pi Broker: compaction left context at ${Math.round(
+              (after / window) * 100,
+            )}% of the window, still at or above the ${AUTO_COMPACT_PERCENT}% ` +
+              "trigger. Automatic mid-loop compaction is standing down for this " +
+              "session to avoid aborting every turn; raise " +
+              "PI_BROKER_COMPACT_AT_PERCENT or lower keepRecentTokens.",
+            "warning",
+          );
+        }
+        send({
+          type: "event",
+          event: "compaction_finished",
+          trigger,
+          ok: true,
+          tokensBefore: result?.tokensBefore,
+          estimatedTokensAfter: result?.estimatedTokensAfter,
+          emittedAt: Date.now(),
+        });
+        if (!resumeAfterCompaction) return;
+        resumeAfterCompaction = false;
+        // Plain delivery, not "steer": compaction left the session idle, and a
+        // steer would be queued against a turn that no longer exists.
+        pi.sendUserMessage(COMPACT_RESUME_TEXT);
+      },
+      onError: (error) => {
+        compactionInFlight = false;
+        resumeAfterCompaction = false;
+        if (trigger === "auto") consecutiveAutoCompactFailures += 1;
+        send({
+          type: "event",
+          event: "compaction_finished",
+          trigger,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+          emittedAt: Date.now(),
+        });
+      },
+    });
+    return true;
+  }
+
+  /**
+   * The mitigation itself: the per-assistant-message threshold check pi does
+   * not do.
+   *
+   * Deliberately scoped to `stopReason === "toolUse"` — the case pi genuinely
+   * never covers. Any other stop reason means the run is about to reach
+   * `agent_end`, where pi's own `_checkCompaction` runs; firing here as well
+   * would race that check and abort a turn that was finishing anyway.
+   */
+  function maybeAutoCompact(
+    stopReason: string | undefined,
+    percent: number | null | undefined,
+  ) {
+    if (AUTO_COMPACT_PERCENT <= 0 || autoCompactStoodDown) return;
+    if (stopReason !== "toolUse") return;
+    if (compactionInFlight) return;
+    if (consecutiveAutoCompactFailures >= MAX_AUTO_COMPACT_FAILURES) return;
+    // null is pi's "unknown", e.g. immediately after a compaction and before
+    // the next response reports usage — not a low reading, so never a trigger.
+    if (percent === null || percent === undefined) return;
+    if (percent < AUTO_COMPACT_PERCENT) return;
+    startCompaction("auto", { resume: true });
+  }
+
   function handle(command: BrokerCommand) {
     if (command.action === "prompt") {
       if (!command.text) return;
@@ -138,6 +332,28 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
     }
     if (command.action === "permission_respond") {
       respondToPermission(command);
+      return;
+    }
+    if (command.action === "compact") {
+      // A controller-forced compaction does not resume on its own: the human or
+      // the controller asked for this, so the next instruction is theirs to
+      // give. Only the automatic mid-loop trigger, which interrupted work
+      // nobody asked to stop, sends the resume nudge.
+      const accepted = startCompaction("manual", {
+        resume: false,
+        customInstructions: command.text,
+      });
+      if (!accepted)
+        send({
+          type: "event",
+          event: "compaction_finished",
+          trigger: "manual",
+          ok: false,
+          error: compactionInFlight
+            ? "a compaction is already running"
+            : "no live session context",
+          emittedAt: Date.now(),
+        });
       return;
     }
     if (command.action === "shutdown") context?.shutdown();
@@ -406,6 +622,25 @@ export default function piBrokerBridge(pi: ExtensionAPI) {
             percent: contextUsage.percent,
           }
         : undefined,
+      emittedAt: Date.now(),
+    });
+    // Report first, act second: the threshold check aborts the run, so doing it
+    // before the send would cost the controller the very reading that explains
+    // why the compaction fired.
+    maybeAutoCompact(event.message.stopReason, contextUsage?.percent);
+  });
+
+  // Forwarded for observability only — the bridge's own compaction state is
+  // driven by compact()'s onComplete/onError callbacks, not by this event,
+  // because this one also fires for compactions pi ran by itself and (for ours)
+  // fires partway through, before the summary is installed.
+  pi.on("session_compact", (event, ctx) => {
+    context = ctx;
+    send({
+      type: "event",
+      event: "session_compact",
+      reason: event.reason,
+      willRetry: event.willRetry,
       emittedAt: Date.now(),
     });
   });

@@ -25,6 +25,13 @@ export const PERMISSION_REQUEST_EVENT = "permission_request";
 export const PERMISSION_RESPOND_ACTION = "permission_respond";
 export const PERMISSION_DECISIONS = ["allow", "deny", "defer"];
 
+// Force a context compaction on a named session. The bridge compacts on its own
+// once context crosses its threshold mid-tool-loop (the gap upstream pi leaves —
+// see extensions/pi-broker-bridge.ts); this is the same lever exposed to a
+// human or controller who wants one *now*, in the same shape as prompt and
+// interrupt. Optional `text` becomes the compaction's custom instructions.
+export const COMPACT_ACTION = "compact";
+
 const requirePermissionVerdict = (message) => {
 	required(message, ["requestId", "decision"]);
 	if (!PERMISSION_DECISIONS.includes(message.decision))
@@ -133,6 +140,15 @@ export const responseMessage = (id, fields = {}) => ({
 	...fields,
 });
 export const errorMessage = (error) => ({ type: "error", error });
+
+/** Controller -> broker: force a compaction on the named session now. */
+export const compactMessage = (id, target, customInstructions) =>
+	sendMessage(
+		id,
+		target,
+		COMPACT_ACTION,
+		customInstructions === undefined ? {} : { text: customInstructions },
+	);
 
 /** Agent -> broker -> controllers: a live `ask` is blocked, waiting on an answer. */
 export const permissionRequestMessage = (requestId, fields = {}) =>

@@ -100,6 +100,60 @@ checkpoint — an `allow` on the `path` or `external_directory` surface is
 downgraded to `defer`, so those requests always reach the human no matter what
 the controller answers. `deny` is never capped.
 
+### Compacting mid-tool-loop, which Pi itself does not
+
+Pi's auto-compaction check runs at `agent_end` and before a new prompt is
+submitted — never between the individual tool calls of one uninterrupted agent
+run ([earendil-works/pi#8884](https://github.com/earendil-works/pi/issues/8884)).
+A model that keeps answering `stopReason: "toolUse"` therefore never reaches the
+check at all. A dispatched session here climbed from 13k to 170k tokens across
+558 consecutive tool-use messages, well past its configured reserve, with zero
+compactions, until the local model server ran out of memory and died.
+
+The bridge closes that gap from inside the ordinary TUI session, using APIs Pi
+already gives every extension. `message_end` fires once per assistant message,
+including every message inside a tool loop; when `getContextUsage().percent`
+crosses the trigger and the message's stop reason is `toolUse`, the bridge calls
+`ExtensionContext.compact()`. Other stop reasons are left alone — those runs are
+about to reach `agent_end`, where Pi's own check already works.
+
+`compact()` aborts the running agent before summarizing, and Pi's own threshold
+path deliberately does not auto-retry either, so a compaction ends the run. For
+a delegated session that would abandon the controller's task half-done, so once
+the summary lands the bridge sends one ordinary user message telling the agent
+to continue — through the same `sendUserMessage` path as any delegated prompt,
+visible in the TUI as input the human can see, interrupt, or override. Nothing
+here uses `-p`, `--print`, or `--mode`.
+
+One compaction at a time: the bridge tracks the in-flight one itself (nothing on
+`ExtensionContext` reports it — `isIdle()` answers a different question, since
+the agent is idle *because* compaction aborted it) and refuses to stack a second.
+It stands the automatic trigger down for the session after three consecutive
+failures, or after one compaction that succeeded but left context still above
+the trigger — either would otherwise abort every turn from then on.
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `PI_BROKER_COMPACT_AT_PERCENT` | `55` | Percent of the context window at which a mid-loop compaction fires. `0` disables the automatic trigger and leaves only the manual one. |
+| `PI_BROKER_COMPACT_RESUME_TEXT` | see source | The continue-from-where-you-left-off message sent after an automatic compaction. |
+
+The controller (or a human) can also force one at any time, in the same shape as
+`prompt` and `interrupt`. Trailing words become the summary's custom
+instructions:
+
+```bash
+npm exec -- pi-broker compact <socket-path> <session-id> [instructions...]
+```
+
+It reports the outcome, not just delivery — `{"compacted":true,"tokensBefore":
+21169,"estimatedTokensAfter":9748}` — and a manual compaction never sends the
+resume message, because whoever asked for it is the one giving the next
+instruction.
+
+Both paths emit `compaction_started` / `compaction_finished` broker events (plus
+Pi's own `session_compact`), so a watching controller sees a compaction happen
+and why, rather than inferring it from a context reading that suddenly dropped.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -322,11 +376,13 @@ Every argument is positional; there are no flags.
 npm exec -- pi-broker list <socket-path>
 npm exec -- pi-broker prompt <socket-path> <session-id> <text...>
 npm exec -- pi-broker interrupt <socket-path> <session-id>
+npm exec -- pi-broker compact <socket-path> <session-id> [instructions...]
 npm exec -- pi-broker mcp <socket-path>
 ```
 
 `prompt` returns the target session's response once the agent settles;
-`interrupt` returns the session to idle without ending it.
+`interrupt` returns the session to idle without ending it; `compact` returns
+once the compaction has actually finished or been refused.
 
 ### Host MCP configuration
 

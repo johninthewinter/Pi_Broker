@@ -11,13 +11,14 @@ const modules = {
   list: "src/client.mjs",
   prompt: "src/client.mjs",
   interrupt: "src/client.mjs",
+  compact: "src/client.mjs",
   mcp: "src/mcp-server.mjs",
   "tmux-cleanup": "scripts/tmux-cleanup.mjs",
 };
 
 function usage() {
   process.stderr.write(
-    "usage: pi-broker.mjs serve <socket> | list <socket> | prompt <socket> <session> <text> | interrupt <socket> <session> | mcp [socket] | tmux-cleanup [socket]\n",
+    "usage: pi-broker.mjs serve <socket> | list <socket> | prompt <socket> <session> <text> | interrupt <socket> <session> | compact <socket> <session> [instructions] | mcp [socket] | tmux-cleanup [socket]\n",
   );
   process.exitCode = 2;
 }
@@ -35,7 +36,11 @@ else {
         ? rest.length === 1
         : command === "prompt"
           ? rest.length >= 3
-          : rest.length === 2;
+          : // compact takes <socket> <session> plus optional trailing custom
+            // instructions for the summary.
+            command === "compact"
+            ? rest.length >= 2
+            : rest.length === 2;
   if (!valid) usage();
   else {
     const moduleArgs =
