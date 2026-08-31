@@ -38,7 +38,7 @@
 // Env overrides (same test seam every other script in this repo uses):
 //   PI_BROKER_TMUX_COMMAND  tmux binary to invoke (default: "tmux")
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -191,19 +191,58 @@ export async function openTmuxDashboard({
   return { dashboardSessionName, windows: targets };
 }
 
+/**
+ * Pure argv parsing for the CLI entry point below: `--attach` may appear
+ * anywhere; whatever's left (at most one value) is the dashboard session
+ * name. `--attach` is opt-in, not the default — this script is also meant to
+ * be safe to call from a non-interactive/orchestrator context (build the
+ * view, report back, exit), which handing the terminal over to a blocking
+ * `tmux attach` would break.
+ */
+export function parseCliArgs(argv) {
+  return {
+    attach: argv.includes("--attach"),
+    dashboardSessionName: argv.find((arg) => arg !== "--attach") || DEFAULT_DASHBOARD_SESSION,
+  };
+}
+
 const invokedDirectly =
   process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (invokedDirectly) {
-  const dashboardSessionName = process.argv[2] || DEFAULT_DASHBOARD_SESSION;
+  const { attach, dashboardSessionName } = parseCliArgs(process.argv.slice(2));
+
+  let result;
   try {
-    const result = await openTmuxDashboard({ dashboardSessionName });
+    result = await openTmuxDashboard({ dashboardSessionName });
+  } catch (error) {
+    process.stderr.write(`pi-broker: dashboard failed: ${error.message}\n`);
+    process.exit(1);
+  }
+
+  if (!attach) {
     process.stdout.write(
       `pi-broker: dashboard ready with ${result.windows.length} pane(s) — attach with:\n` +
         `  tmux attach -t ${result.dashboardSessionName}\n`,
     );
-  } catch (error) {
-    process.stderr.write(`pi-broker: dashboard failed: ${error.message}\n`);
-    process.exit(1);
+  } else {
+    process.stdout.write(
+      `pi-broker: dashboard ready with ${result.windows.length} pane(s) — attaching...\n`,
+    );
+    // Hand the terminal over directly rather than printing instructions —
+    // only meaningful when run from a real interactive terminal, which is
+    // exactly what --attach signals the caller has. Inherited stdio blocks
+    // here until the human detaches (Ctrl-b d) or closes it. Deliberately
+    // outside the build's try/catch: a normal detach, or the human killing
+    // the session while attached, is not a "dashboard failed" — the
+    // dashboard already did its job by the time we get here.
+    const tmuxCommand = process.env.PI_BROKER_TMUX_COMMAND || "tmux";
+    try {
+      execFileSync(tmuxCommand, ["attach", "-t", result.dashboardSessionName], {
+        stdio: "inherit",
+      });
+    } catch {
+      // Non-zero exit from tmux itself on detach/kill — not a build failure.
+    }
   }
 }

@@ -330,9 +330,16 @@ PI_QUICKSTART_TARGET_DIR=/path/to/other/repo npm run quickstart -- 1
 only one at a time. When you want several visible simultaneously:
 
 ```bash
-npm run tmux:dashboard
-tmux attach -t pi-broker-dashboard
+npm run tmux:dashboard:open
 ```
+
+does both steps in one — builds the view, then hands the terminal straight
+over to it, exactly as if you'd typed `tmux attach` yourself. Detach with
+`Ctrl-b d` the same as any tmux session. `npm run tmux:dashboard` on its own
+still does the build-only, non-blocking step (also usable as
+`pi-broker dashboard [name] [--attach]` from anywhere, or the exported
+`openTmuxDashboard()` for orchestration code) — useful when whatever is
+calling it has no real terminal to hand over.
 
 This builds a tiled view of every live session's window, side by side, in one
 screen. It never uses `join-pane` — that tmux primitive physically *moves* a

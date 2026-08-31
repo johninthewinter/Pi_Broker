@@ -19,7 +19,7 @@ const modules = {
 
 function usage() {
   process.stderr.write(
-    "usage: pi-broker.mjs serve <socket> | list <socket> | prompt <socket> <session> <text> | interrupt <socket> <session> | compact <socket> <session> [instructions] | mcp [socket] | tmux-cleanup [socket] | dashboard [dashboardSessionName]\n",
+    "usage: pi-broker.mjs serve <socket> | list <socket> | prompt <socket> <session> <text> | interrupt <socket> <session> | compact <socket> <session> [instructions] | mcp [socket] | tmux-cleanup [socket] | dashboard [dashboardSessionName] [--attach]\n",
   );
   process.exitCode = 2;
 }
@@ -29,11 +29,15 @@ else {
   const rest = args.slice(1);
   const valid =
     // `mcp` alone is legal: the adapter then uses the deterministic default
-    // socket and starts the broker there itself. `tmux-cleanup` and
-    // `dashboard` follow the same shape — an optional single positional
-    // argument (a socket, or a dashboard session name), or none at all.
-    command === "mcp" || command === "tmux-cleanup" || command === "dashboard"
+    // socket and starts the broker there itself. `tmux-cleanup` follows the
+    // same shape — an optional single positional argument (a socket), or
+    // none at all. `dashboard` takes the same optional positional (a
+    // dashboard session name) plus an optional `--attach` flag, in either
+    // order, so up to two args.
+    command === "mcp" || command === "tmux-cleanup"
       ? rest.length <= 1
+      : command === "dashboard"
+        ? rest.length <= 2
       : command === "serve" || command === "list"
         ? rest.length === 1
         : command === "prompt"
